@@ -65,7 +65,7 @@ merge_file = merge_file_dataset.as_download()
 # Setup training environment
 #-------------------------------------------------------------------------------
 megatron_ds_env = Environment.from_dockerfile(name='megatron-ds-ptca', dockerfile='Dockerfile.dockerfile')
-megatron_ds_env.register(ws).build(ws).wait_for_completion()  # Comment this out if environment already exists
+#megatron_ds_env.register(ws).build(ws).wait_for_completion()  # Comment this out if environment already exists
 
 megatron_ds_env.environment_variables['NCCL_DEBUG'] = 'WARN'
 megatron_ds_env.environment_variables['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
@@ -129,7 +129,7 @@ run_args = ['--tensor-model-parallel-size', 1,
             '--zero-stage', 3,
             '--deepspeed-activation-checkpointing',
             '--exit-interval', 5000,
-            '--ort'
+            #'--ort'
 ]
 
 #-------------------------------------------------------------------------------
