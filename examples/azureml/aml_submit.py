@@ -73,7 +73,6 @@ megatron_ds_env.environment_variables['NCCL_SOCKET_IFNAME'] = 'eth0'
 megatron_ds_env.environment_variables['NCCL_IB_PCI_RELAXED_ORDERING']='1'
 megatron_ds_env.environment_variables['UCX_TLS']='tcp'
 megatron_ds_env.environment_variables['UCX_NET_DEVICES']='eth0'
-megatron_ds_env.environment_variables['ORTMODULE_FALLBACK_POLICY']='FALLBACK_DISABLE'
 
 #-------------------------------------------------------------------------------
 # Training Settings and Arguments
@@ -129,7 +128,7 @@ run_args = ['--tensor-model-parallel-size', 1,
             '--zero-stage', 3,
             '--deepspeed-activation-checkpointing',
             '--exit-interval', 5000,
-            #'--ort'
+            '--ort'
 ]
 
 #-------------------------------------------------------------------------------
