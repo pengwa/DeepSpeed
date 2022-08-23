@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/azureml/aifx/stable-ubuntu2004-cu115-py38-torch1110
+FROM ptebic.azurecr.io/public/azureml/aifx/stable-ubuntu2004-cu113-py38-torch1110:latest
 
 USER root:root
 
