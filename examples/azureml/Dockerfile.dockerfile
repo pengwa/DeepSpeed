@@ -4,9 +4,9 @@ USER root:root
 
 RUN pip install pybind11 regex
 
-# RUN pip install git+https://github.com/microsoft/DeepSpeed.git
+RUN pip install git+https://github.com/microsoft/DeepSpeed.git
 
-RUN git clone https://github.com/prathikr/DeepSpeed.git&&\
-	cd DeepSpeed &&\
-	git checkout prathikrao/detach-gradient &&\
-	pip install -e .
+#RUN git clone https://github.com/prathikr/DeepSpeed.git&&\
+#	cd DeepSpeed &&\
+#	git checkout prathikrao/detach-gradient &&\
+#	pip install -e .
