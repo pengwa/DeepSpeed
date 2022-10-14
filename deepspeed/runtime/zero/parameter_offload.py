@@ -4,6 +4,7 @@ Licensed under the MIT license.
 """
 
 import sys
+from typing import Sequence
 import torch
 from torch.cuda import Stream
 from collections import OrderedDict
@@ -172,6 +173,105 @@ class PostBackwardFunction(torch.autograd.Function):
         return (None, None) + args
 
 
+
+def _recursively_apply_to_tensors_only(module, function, outputs):
+    if isinstance(outputs, (tuple, list)):
+        touched_outputs = []
+        for output in outputs:
+            touched_output = _recursively_apply_to_tensors_only(module,function, output)
+            touched_outputs.append(touched_output)
+        return outputs.__class__(touched_outputs)
+    elif isinstance(outputs, dict):
+        # apply inplace to avoid recreating dict inherited objects
+        for key in outputs.keys():
+            outputs[key] = _recursively_apply_to_tensors_only(module,function,outputs[key])
+        return outputs
+
+    elif type(outputs) is torch.Tensor:
+        return function(outputs)
+    else:
+        if not is_builtin_type(outputs):
+            global warned
+            if not warned and dist.get_rank() == 0:
+                logger.warning(
+                    f"A module has unknown inputs or outputs type ({type(outputs)}) and the tensors embedded in it cannot be detected. "
+                    "The ZeRO-3 hooks designed to trigger before or after backward pass of the module relies on knowing the input and "
+                    "output tensors and therefore may not get triggered properly.")
+                warned = True
+        return outputs
+
+class ORTPreForwardwardFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, offload, module, post_backward_function, inputs):
+        offload.pre_sub_module_forward_function(module)
+
+        ctx.module = module
+        ctx.offload = offload
+        ctx.post_backward_function = post_backward_function
+        ctx.num_of_input = len(inputs)
+
+        module.ds_grads_remaining = 0
+        def func(input_):
+            if input_.requires_grad:
+                #TODO SOME TIMES post backward does not seem to be triggered debug in detail
+                #Should only cause increase in memory not correctness issue
+                #if output.grad_fn.__class__.__name__ == 'ViewBackward':
+                #    ctx.view=True
+                #    print(f"Warning view tensor for input to module : {module.__class__.__name__}. Backward hooks may not trigger properly")
+                #assert len(module.parameters(recurse=False)), "The input tensor to the module is a view, and autograd Function or register_hook is not triggered with view tensors."
+                #if module.ds_grads_remaining == 0:
+                #    print(f"Before Forward: {ctx.module.__class__.__name__}")
+                module.ds_grads_remaining += 1
+            return input_.detach().requires_grad_(input_.requires_grad)
+
+        rets = _recursively_apply_to_tensors_only(module, func, inputs)
+        return rets
+
+    @staticmethod
+    def backward(ctx, *args):
+        for i in range(ctx.num_of_input):
+            #print(f"Before Backward: {ctx.module.__class__.__name__}")
+            ctx.post_backward_function(ctx.offload, ctx.module)
+        return (None, None, None) + args
+
+
+class ORTPostForwardwardFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, module, post_forward_function, pre_backward_function, inputs, outputs):
+        post_forward_function(module, inputs, outputs)
+
+        ctx.module = module
+        ctx.pre_backward_function = pre_backward_function
+        if not hasattr(module, "applied_pre_backward_ref_cnt"):
+            module.applied_pre_backward_ref_cnt = 0
+        module.applied_pre_backward_ref_cnt += 1
+        #print(f"After Forward: {ctx.module.__class__.__name__}")
+        if isinstance(outputs, torch.Tensor):
+            return outputs.detach()
+        if isinstance(outputs, (tuple, list)):
+            outputs = [output.detach().requires_grad_(output.requires_grad) if output is not None else None for output in outputs]
+            return outputs
+        else:
+            raise RuntimeError("fail handling output of forward")
+
+    @staticmethod
+    def backward(ctx, *args):
+        #print(f"Before Backward: {ctx.module.__class__.__name__}")
+        ctx.pre_backward_function(ctx.module)
+        return (None, None, None, None) + args
+
+
+class ORTFinalForwardCleanupFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, offload):
+        if not torch._C.is_grad_enabled():
+            offload.get_param_coordinator(training=False).reset_step()
+        return None
+
+    @staticmethod
+    def backward(ctx, *args):
+        return (None)
+
 class DeepSpeedZeRoOffload(object):
     def __init__(self,
                  module,
@@ -295,9 +395,9 @@ class DeepSpeedZeRoOffload(object):
         #reset step if in inference mode
         @instrument_w_nvtx
         def _end_of_forward_hook(module, *args):
-
-            if not torch._C.is_grad_enabled():
-                self.get_param_coordinator(training=False).reset_step()
+            ORTFinalForwardCleanupFunction.apply(self)
+            # if not torch._C.is_grad_enabled():
+            #     self.get_param_coordinator(training=False).reset_step()
 
         #likely one of them should be enough but just to be safe
         self._register_hooks_recursively(self.module)
@@ -421,6 +521,7 @@ class DeepSpeedZeRoOffload(object):
                 _run_after_backward_hook,
                 inputs)
 
+
         def _post_backward_module_hook(module, inputs):
             module.ds_grads_remaining = 0
 
@@ -435,20 +536,64 @@ class DeepSpeedZeRoOffload(object):
                                           inputs)
 
         # Pre forward hook
+        # self.forward_hooks.append(
+        #     module.register_forward_pre_hook(_pre_forward_module_hook))
+        def _ort_run_before_backward_function(offload, sub_module):
+            print("enter _ort_run_before_backward_function", sub_module)
+            # some models (e.g. Albert) may run multiple forwards on the same layer in a loop
+            # before doing backwards, so each backward will need a pre-fetch - using reference
+            # counting to support this scenario
+            #print(f"COUNTER before: {sub_module.applied_pre_backward_ref_cnt}")
+            if sub_module.applied_pre_backward_ref_cnt > 0:
+                offload.pre_sub_module_backward_function(sub_module)
+                sub_module.applied_pre_backward_ref_cnt -= 1
+            #print(f"COUNTER after: {sub_module.applied_pre_backward_ref_cnt}")
+            print("exit _ort_run_before_backward_function")
+
+        def _ort_pre_forward_module_hook(module, inputs):
+            print("enter _ort_pre_forward_module_hook", module, inputs)
+            a = ORTPreForwardwardFunction.apply(self, module, _ort_run_before_backward_function, inputs)
+            print("exit _ort_pre_forward_module_hook", module, a)
+            return a
+
         self.forward_hooks.append(
-            module.register_forward_pre_hook(_pre_forward_module_hook))
+            module.register_forward_pre_hook(_ort_pre_forward_module_hook))
 
         # Post forward hook
+
+        def _ort_run_before_backward_function(sub_module):
+            print("enter _ort_run_before_backward_function", sub_module)
+            # some models (e.g. Albert) may run multiple forwards on the same layer in a loop
+            # before doing backwards, so each backward will need a pre-fetch - using reference
+            # counting to support this scenario
+            #print(f"COUNTER before: {sub_module.applied_pre_backward_ref_cnt}")
+            if sub_module.applied_pre_backward_ref_cnt > 0:
+                self.pre_sub_module_backward_function(sub_module)
+                sub_module.applied_pre_backward_ref_cnt -= 1
+            #print(f"COUNTER after: {sub_module.applied_pre_backward_ref_cnt}")
+            print("exit _ort_run_before_backward_function")
+
+
+        def _ort_post_forward_module_hook(module, input, output):
+            print("enter _ort_post_forward_module_hook", module, input, output)
+            a = ORTPostForwardwardFunction.apply(module, _post_forward_module_hook, _ort_run_before_backward_function, input, output)
+            print("exit _ort_post_forward_module_hook", module, input, a)
+            return a
+
+
+        # self.forward_hooks.append(
+        #     module.register_forward_hook(_post_forward_module_hook))
+
         self.forward_hooks.append(
-            module.register_forward_hook(_post_forward_module_hook))
+            module.register_forward_hook(_ort_post_forward_module_hook))
 
         # Pre backward hook
-        self.backward_hooks.append(
-            module.register_forward_hook(_pre_backward_module_hook))
+        # self.backward_hooks.append(
+        #     module.register_forward_hook(_pre_backward_module_hook))
 
         # post backward hook
-        self.backward_hooks.append(
-            module.register_forward_pre_hook(_post_backward_module_hook))
+        # self.backward_hooks.append(
+        #     module.register_forward_pre_hook(_post_backward_module_hook))
 
     @torch.no_grad()
     def pre_sub_module_forward_function(self, sub_module):
