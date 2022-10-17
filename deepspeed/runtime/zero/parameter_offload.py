@@ -4,7 +4,7 @@ Licensed under the MIT license.
 """
 
 import sys
-from typing import Sequence
+from typing import Any, Sequence, Union, Tuple, Dict
 import torch
 from torch.cuda import Stream
 from collections import OrderedDict
@@ -202,13 +202,13 @@ def _recursively_apply_to_tensors_only(module, function, outputs):
 
 class ORTPreForwardwardFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, offload, module, post_backward_function, inputs):
+    def forward(ctx, offload, module, post_backward_function, input_count, *inputs):
         offload.pre_sub_module_forward_function(module)
 
         ctx.module = module
         ctx.offload = offload
         ctx.post_backward_function = post_backward_function
-        ctx.num_of_input = len(inputs)
+        ctx.num_of_input = input_count
 
         module.ds_grads_remaining = 0
         def func(input_):
@@ -232,16 +232,19 @@ class ORTPreForwardwardFunction(torch.autograd.Function):
         for i in range(ctx.num_of_input):
             #print(f"Before Backward: {ctx.module.__class__.__name__}")
             ctx.post_backward_function(ctx.offload, ctx.module)
-        return (None, None, None) + args
+        return (None, None, None, None) + args
 
 
 class ORTPostForwardwardFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, module, post_forward_function, pre_backward_function, inputs, outputs):
+    def forward(ctx, module, post_forward_function, pre_backward_function, input_count, *inputs_and_outputs):
+        inputs = inputs_and_outputs[:input_count]
+        outputs = inputs_and_outputs[input_count:]
         post_forward_function(module, inputs, outputs)
 
         ctx.module = module
         ctx.pre_backward_function = pre_backward_function
+        ctx.input_count = input_count
         if not hasattr(module, "applied_pre_backward_ref_cnt"):
             module.applied_pre_backward_ref_cnt = 0
         module.applied_pre_backward_ref_cnt += 1
@@ -258,19 +261,19 @@ class ORTPostForwardwardFunction(torch.autograd.Function):
     def backward(ctx, *args):
         #print(f"Before Backward: {ctx.module.__class__.__name__}")
         ctx.pre_backward_function(ctx.module)
-        return (None, None, None, None) + args
+        return (None, None, None, None) + (None) * ctx.input_count + args
 
 
 class ORTFinalForwardCleanupFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, offload):
-        if not torch._C.is_grad_enabled():
+    def forward(ctx, offload, is_grad_enabled):
+        if not is_grad_enabled:
             offload.get_param_coordinator(training=False).reset_step()
         return None
 
     @staticmethod
     def backward(ctx, *args):
-        return (None)
+        return (None, None)
 
 class DeepSpeedZeRoOffload(object):
     def __init__(self,
@@ -395,7 +398,7 @@ class DeepSpeedZeRoOffload(object):
         #reset step if in inference mode
         @instrument_w_nvtx
         def _end_of_forward_hook(module, *args):
-            ORTFinalForwardCleanupFunction.apply(self)
+            ORTFinalForwardCleanupFunction.apply(self, torch._C.is_grad_enabled())
             # if not torch._C.is_grad_enabled():
             #     self.get_param_coordinator(training=False).reset_step()
 
@@ -539,7 +542,7 @@ class DeepSpeedZeRoOffload(object):
         # self.forward_hooks.append(
         #     module.register_forward_pre_hook(_pre_forward_module_hook))
         def _ort_run_before_backward_function(offload, sub_module):
-            print("enter _ort_run_before_backward_function", sub_module)
+            # print("enter _ort_run_before_backward_function", sub_module, sub_module.training)
             # some models (e.g. Albert) may run multiple forwards on the same layer in a loop
             # before doing backwards, so each backward will need a pre-fetch - using reference
             # counting to support this scenario
@@ -548,12 +551,22 @@ class DeepSpeedZeRoOffload(object):
                 offload.pre_sub_module_backward_function(sub_module)
                 sub_module.applied_pre_backward_ref_cnt -= 1
             #print(f"COUNTER after: {sub_module.applied_pre_backward_ref_cnt}")
-            print("exit _ort_run_before_backward_function")
+            # print("exit _ort_run_before_backward_function", sub_module.training)
 
         def _ort_pre_forward_module_hook(module, inputs):
-            print("enter _ort_pre_forward_module_hook", module, inputs)
-            a = ORTPreForwardwardFunction.apply(self, module, _ort_run_before_backward_function, inputs)
-            print("exit _ort_pre_forward_module_hook", module, a)
+            # print("enter _ort_pre_forward_module_hook", module, module.training)
+            input = inputs
+            input_count = len(input)
+            if isinstance(input, torch.Tensor):
+                input_count = 1
+
+            a = ORTPreForwardwardFunction.apply(self, module, _ort_run_before_backward_function, len(input), *input)
+            # import traceback
+            # traceback.print_stack()
+            if input_count == 1:
+                a = a[0]
+
+            # print("exit _ort_pre_forward_module_hook", module, module.training, inputs,  a)
             return a
 
         self.forward_hooks.append(
@@ -562,7 +575,7 @@ class DeepSpeedZeRoOffload(object):
         # Post forward hook
 
         def _ort_run_before_backward_function(sub_module):
-            print("enter _ort_run_before_backward_function", sub_module)
+            # print("enter _ort_run_before_backward_function", sub_module, sub_module.training)
             # some models (e.g. Albert) may run multiple forwards on the same layer in a loop
             # before doing backwards, so each backward will need a pre-fetch - using reference
             # counting to support this scenario
@@ -571,13 +584,33 @@ class DeepSpeedZeRoOffload(object):
                 self.pre_sub_module_backward_function(sub_module)
                 sub_module.applied_pre_backward_ref_cnt -= 1
             #print(f"COUNTER after: {sub_module.applied_pre_backward_ref_cnt}")
-            print("exit _ort_run_before_backward_function")
+            # print("exit _ort_run_before_backward_function ", sub_module.training)
 
 
-        def _ort_post_forward_module_hook(module, input, output):
-            print("enter _ort_post_forward_module_hook", module, input, output)
-            a = ORTPostForwardwardFunction.apply(module, _post_forward_module_hook, _ort_run_before_backward_function, input, output)
-            print("exit _ort_post_forward_module_hook", module, input, a)
+        def _ort_post_forward_module_hook(module, inputs, outputs):
+            # print("enter _ort_post_forward_module_hook", module, module.training, outputs)
+            input = inputs
+            output = outputs
+            if isinstance(input, torch.Tensor):
+                input = [input]
+
+            if isinstance(output, torch.Tensor):
+                output = [output]
+
+            assert isinstance(input, (tuple, list))
+            assert isinstance(output, (tuple, list))
+            input_and_output = []
+            for i in input:
+                input_and_output.append(i)
+            for o in output:
+                input_and_output.append(o)
+            # input_tensors, packed_non_tensors = split_non_tensors(input)
+            a = ORTPostForwardwardFunction.apply(module, _post_forward_module_hook, _ort_run_before_backward_function, len(input), *input_and_output)
+            # print("exit _ort_post_forward_module_hook", module, module.training)
+            if isinstance(outputs, torch.Tensor) and not isinstance(a, torch.Tensor):
+                print(a)
+                assert len(a) == 1
+                a = a[0]
             return a
 
 
