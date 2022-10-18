@@ -237,7 +237,7 @@ class ORTPreForwardwardFunction(torch.autograd.Function):
 
 class ORTPostForwardwardFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, module, post_forward_function, pre_backward_function, input_count, *inputs_and_outputs):
+    def forward(ctx, module, post_forward_function, pre_backward_function, input_count, output_count, *inputs_and_outputs):
         inputs = inputs_and_outputs[:input_count]
         outputs = inputs_and_outputs[input_count:]
         post_forward_function(module, inputs, outputs)
@@ -253,6 +253,10 @@ class ORTPostForwardwardFunction(torch.autograd.Function):
             return outputs.detach()
         if isinstance(outputs, (tuple, list)):
             outputs = [output.detach().requires_grad_(output.requires_grad) if output is not None else None for output in outputs]
+            if output_count == 1:
+            #     print(a)
+            #     assert len(a) == 1
+                outputs = outputs[0]
             return outputs
         else:
             raise RuntimeError("fail handling output of forward")
@@ -261,7 +265,7 @@ class ORTPostForwardwardFunction(torch.autograd.Function):
     def backward(ctx, *args):
         #print(f"Before Backward: {ctx.module.__class__.__name__}")
         ctx.pre_backward_function(ctx.module)
-        return (None, None, None, None) + (None) * ctx.input_count + args
+        return (None, None, None, None, None) + (None) * ctx.input_count + args
 
 
 class ORTFinalForwardCleanupFunction(torch.autograd.Function):
@@ -605,13 +609,14 @@ class DeepSpeedZeRoOffload(object):
             for o in output:
                 input_and_output.append(o)
             # input_tensors, packed_non_tensors = split_non_tensors(input)
-            a = ORTPostForwardwardFunction.apply(module, _post_forward_module_hook, _ort_run_before_backward_function, len(input), *input_and_output)
-            # print("exit _ort_post_forward_module_hook", module, module.training)
-            if isinstance(outputs, torch.Tensor) and not isinstance(a, torch.Tensor):
-                print(a)
-                assert len(a) == 1
-                a = a[0]
+            a = ORTPostForwardwardFunction.apply(module, _post_forward_module_hook, _ort_run_before_backward_function, len(input), len(output), *input_and_output)
+            print("exit _ort_post_forward_module_hook", module, module.training)
             return a
+            # if isinstance(outputs, torch.Tensor) and not isinstance(a, torch.Tensor):
+            #     print(a)
+            #     assert len(a) == 1
+            #     a = a[0]
+            # return a
 
 
         # self.forward_hooks.append(
