@@ -967,7 +967,10 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         param.is_external_param = False
 
         # The group that the parameter is scattered across.
-        param.ds_process_group = self.ds_process_group
+        # param.ds_process_group = self.ds_process_group
+        param.ds_process_group = dist.get_world_group() # pengwa, to fix the issue 
+        # RuntimeError: Tried to trace <__torch__.torch.classes.c10d.ProcessGroup object at 0x555c99fdb000> 
+        # but it is not part of the active trace. Modules that are called during a trace must be registered as 
 
         # Stores the secondary partitioned copy of the tensor
         param.ds_secondary_tensor = None
@@ -1012,7 +1015,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 param.ds_status = ZeroParamStatus.INFLIGHT
 
             #use appropriate all gather process group
-            ds_process_group = self.ds_process_group
+            ds_process_group = dist.get_world_group() # pengwa, self.ds_process_group
             rank_in_group = self.rank
             world_size = self.dp_world_size
             use_secondary_tensor = False
@@ -1057,6 +1060,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 )
                 param_ds_tensor = param.ds_secondary_tensor if not forward and param.ds_secondary_tensor is not None else param.ds_tensor
                 if not quant:
+                    print("_dist_allgather_fn>>ds_process_group: ", ds_process_group)
                     handles = _dist_allgather_fn(
                         param_ds_tensor.to(get_accelerator().current_device()),
                         param_buffer,
@@ -1386,8 +1390,10 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
             if start < param.ds_numel and end <= param.ds_numel:
                 src_tensor = one_dim_param.narrow(0, start, partition_size)
-
-                param.ds_tensor.copy_(src_tensor)
+                with torch.no_grad():
+                    # make sure param.ds_tensor requires_grad always be false,
+                    # otherwise, torch tracer will complain.
+                    param.ds_tensor.copy_(src_tensor)
 
                 #partitioned_tensor = src_tensor.clone().detach().to(self.remote_device)
 
@@ -1397,9 +1403,12 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 #                                  device=self.remote_device )
 
                 if start < param.ds_numel:
-                    elements_to_copy = param.ds_numel - start
-                    param.ds_tensor.narrow(0, 0,
-                                           elements_to_copy).copy_(one_dim_param.narrow(0, start, elements_to_copy))
+                    with torch.no_grad():
+                        # make sure param.ds_tensor requires_grad always be false,
+                        # otherwise, torch tracer will complain.
+                        elements_to_copy = param.ds_numel - start
+                        param.ds_tensor.narrow(0, 0,
+                                            elements_to_copy).copy_(one_dim_param.narrow(0, start, elements_to_copy))
 
             #print(f"Remote device {self.remote_device}")
 
@@ -1797,7 +1806,7 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
     def get_dp_process_group(self):
         """ Return the communication group with all data-parallel ranks """
-        return self.ds_process_group
+        return dist.get_world_group() #pengwa  self.ds_process_group
 
 
 class GatheredParameters:

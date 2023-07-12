@@ -21,6 +21,7 @@
         -- deepspeed groups API should be brought into ds.comm
 """
 
+from typing import Any, List
 import torch
 import os
 
@@ -303,13 +304,39 @@ def has_all_gather_into_tensor():
     ), 'DeepSpeed backend not set, please initialize it using init_process_group()'
     return cdb.has_all_gather_into_tensor()
 
+class DummyWork(torch.distributed.distributed_c10d.Work):
+    # def __init__(self):
+    #     pass
+
+    def is_completed(self) -> bool:
+        return True
+    def is_success(self) -> bool:
+        return True
+    def exception(self) -> Any:
+        return None
+    def wait(self, timeout: timedelta = timedelta) -> bool:
+        return True
+    def source_rank(self) -> int:
+        return 0
+    def _source_rank(self) -> int:
+        return 0
+    def result(self) -> List[torch.Tensor]:
+        return []
+    def synchronize(self):
+        pass
+
 
 def allgather_fn(output_tensor, input_tensor, group=None, async_op=False, debug=get_caller_func()):
+    if torch.onnx.is_in_onnx_export():
+        return DummyWork()
+    
     global cdb
     assert cdb is not None and cdb.is_initialized(
     ), 'DeepSpeed backend not set, please initialize it using init_process_group()'
     if cdb.has_all_gather_into_tensor():
-        return all_gather_into_tensor(output_tensor, input_tensor, group=group, async_op=async_op, debug=debug)
+        a = all_gather_into_tensor(output_tensor, input_tensor, group=group, async_op=async_op, debug=debug)
+        # print("allgather_fn>>", type(a), a)
+        return a
     else:
         if get_rank() == 0:
             utils.logger.warning_once("unable to find torch.distributed.all_gather_into_tensor. will fall back to "

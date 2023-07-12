@@ -3,7 +3,9 @@
 
 # DeepSpeed Team
 
+from collections import OrderedDict, abc
 import sys
+from typing import Mapping, Optional, Sequence, Union
 import torch
 from collections import OrderedDict
 from deepspeed.runtime.utils import see_memory_usage
@@ -131,6 +133,7 @@ class ZeROOrderedDict(OrderedDict):
 
         if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
             if self._parent_module._parameters._in_forward:
+                # print("~~~~~~~~~~~len(FWD_MODULE_STACK): ", len(FWD_MODULE_STACK))
                 register_external_parameter(FWD_MODULE_STACK[-1], param)
                 param.all_gather()
                 print_rank_0(f'Registering external parameter from getter {key} ds_id = {param.ds_id}', force=False)
@@ -197,6 +200,160 @@ class PostBackwardFunction(torch.autograd.Function):
             #print(f"After Backward: {ctx.module.__class__.__name__}")
         return (None, None) + args
 
+def _recursively_apply_to_tensors_only(module, function, outputs):
+    if isinstance(outputs, (tuple, list)):
+        touched_outputs = []
+        for output in outputs:
+            touched_output = _recursively_apply_to_tensors_only(module,function, output)
+            touched_outputs.append(touched_output)
+        return outputs.__class__(touched_outputs)
+    elif isinstance(outputs, dict):
+        # apply inplace to avoid recreating dict inherited objects
+        for key in outputs.keys():
+            outputs[key] = _recursively_apply_to_tensors_only(module,function,outputs[key])
+        return outputs
+
+    elif type(outputs) is torch.Tensor:
+        # this also applies to torch.Tensor's subclasses like torch.nn.parameter.Parameter
+        touched_outputs = function(outputs)
+
+        # restore zero param attributes if those get stripped by `backward_function`
+        if not is_zero_param(touched_outputs) and is_zero_param(outputs):
+            touched_outputs.ds_param_alias = outputs
+        return touched_outputs
+    else:
+        if not is_builtin_type(outputs):
+            global warned
+            if not warned and dist.get_rank() == 0:
+                logger.warning(
+                    f"A module has unknown inputs or outputs type ({type(outputs)}) and the tensors embedded in it cannot be detected. "
+                    "The ZeRO-3 hooks designed to trigger before or after backward pass of the module relies on knowing the input and "
+                    "output tensors and therefore may not get triggered properly.")
+                warned = True
+        return outputs
+
+
+class ORTPreForwardwardFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, offload, module, post_backward_function, *inputs):
+        offload.pre_sub_module_forward_function(module)
+
+        ctx.module = module
+        ctx.offload = offload
+        ctx.post_backward_function = post_backward_function
+
+        module.ds_grads_remaining = 0
+        def func(input_):
+            if input_.requires_grad:
+                #TODO SOME TIMES post backward does not seem to be triggered debug in detail
+                #Should only cause increase in memory not correctness issue
+                #if output.grad_fn.__class__.__name__ == 'ViewBackward':
+                #    ctx.view=True
+                #    print(f"Warning view tensor for input to module : {module.__class__.__name__}. Backward hooks may not trigger properly")
+                #assert len(module.parameters(recurse=False)), "The input tensor to the module is a view, and autograd Function or register_hook is not triggered with view tensors."
+                #if module.ds_grads_remaining == 0:
+                #    print(f"Before Forward: {ctx.module.__class__.__name__}")
+                module.ds_grads_remaining += 1
+            return input_.detach().requires_grad_(input_.requires_grad)
+
+        rets = _recursively_apply_to_tensors_only(module, func, inputs)
+        if not isinstance(rets, (tuple, list, dict, torch.Tensor)):
+            input_count = 0
+        elif isinstance(rets, torch.Tensor):
+            input_count = 1
+        else:
+            input_count = len(rets)
+        ctx.num_of_input = input_count
+        if input_count == 0:
+            # pengwa: need return something instead of empty list, otherwise, torch export explains "Couldn't lower all tuples. prim::PythonOp"
+            return None
+        return rets
+
+    @staticmethod
+    def backward(ctx, *args):
+        # ctx.module.ds_grads_remaining = ctx.module.ds_grads_remaining - 1
+        # if ctx.module.ds_grads_remaining == 0:
+        ctx.module.ds_grads_remaining = 0 # pengwa
+        if ctx.num_of_input > 0:
+            #print(f"Before Backward: {ctx.module.__class__.__name__}")
+            ctx.post_backward_function(ctx.offload, ctx.module)
+        return (None, None, None,) + args
+
+
+def _recursively_tensor_apply_func(function, outputs):
+    if isinstance(outputs, (tuple, list)):
+        touched_outputs = []
+        for output in outputs:
+            touched_output = _recursively_tensor_apply_func(function, output)
+            touched_outputs.append(touched_output)
+        return outputs.__class__(touched_outputs)
+    elif isinstance(outputs, dict):
+        # apply inplace to avoid recreating dict inherited objects
+        for key in outputs.keys():
+            outputs[key] = _recursively_tensor_apply_func(function, outputs[key])
+        return outputs
+
+    elif type(outputs) is torch.Tensor:
+        # this also applies to torch.Tensor's subclasses like torch.nn.parameter.Parameter
+        touched_outputs = function(outputs)
+        return touched_outputs
+    else:
+        if not is_builtin_type(outputs):
+            global warned
+            if not warned and dist.get_rank() == 0:
+                logger.warning(
+                    f"A module has unknown inputs or outputs type ({type(outputs)}) and the tensors embedded in it cannot be detected. "
+                    "The ZeRO-3 hooks designed to trigger before or after backward pass of the module relies on knowing the input and "
+                    "output tensors and therefore may not get triggered properly.")
+                warned = True
+        return outputs
+
+
+class ORTPostForwardwardFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, module, post_forward_function, pre_backward_function, input_count, output_count, *inputs_and_outputs):
+        inputs = inputs_and_outputs[:input_count]
+        outputs = inputs_and_outputs[input_count:]
+        post_forward_function(module, inputs, outputs)
+
+        ctx.module = module
+        ctx.pre_backward_function = pre_backward_function
+        ctx.input_count = input_count
+        if not hasattr(module, "applied_pre_backward_ref_cnt"):
+            module.applied_pre_backward_ref_cnt = 0
+        module.applied_pre_backward_ref_cnt += 1
+        #print(f"After Forward: {ctx.module.__class__.__name__}")
+
+        return _recursively_tensor_apply_func(lambda x: x.detach().requires_grad_(x.requires_grad) if x is not None else None, outputs)
+        # if isinstance(outputs, torch.Tensor):
+        #     return outputs.detach()
+        # if isinstance(outputs, (tuple, list)):
+        #     outputs = [output.detach().requires_grad_(output.requires_grad) if output is not None else None for output in outputs]
+        #     if output_count == 1:
+        #     #     print(a)
+        #     #     assert len(a) == 1
+        #         outputs = outputs[0]
+        #     return outputs
+        # else:
+        #     raise RuntimeError("fail handling output of forward")
+
+    @staticmethod
+    def backward(ctx, *args):
+        #print(f"Before Backward: {ctx.module.__class__.__name__}")
+        ctx.pre_backward_function(ctx.module)
+        return (None, None, None, None, None) + (None,) * ctx.input_count + args
+
+
+class ORTFinalForwardCleanupFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, offload, is_grad_enabled):
+        if not is_grad_enabled:
+            offload.get_param_coordinator(training=False).reset_step()
+        return None
+
+    @staticmethod
+    def backward(ctx, *args):
+        return (None, None)
 
 class DeepSpeedZeRoOffload(object):
 
@@ -336,8 +493,10 @@ class DeepSpeedZeRoOffload(object):
         @instrument_w_nvtx
         def _end_of_forward_hook(module, *args):
 
-            if not torch._C.is_grad_enabled():
-                self.get_param_coordinator(training=False).reset_step()
+            # if not torch._C.is_grad_enabled():
+            #     self.get_param_coordinator(training=False).reset_step()
+
+            ORTFinalForwardCleanupFunction.apply(self, torch._C.is_grad_enabled())
 
         #likely one of them should be enough but just to be safe
         self._register_hooks_recursively(self.module)
@@ -469,16 +628,228 @@ class DeepSpeedZeRoOffload(object):
             return _apply_to_tensors_only(module, PostBackwardFunction, _run_after_backward_function, inputs)
 
         # Pre forward hook
-        self.forward_hooks.append(module.register_forward_pre_hook(_pre_forward_module_hook))
+        # self.forward_hooks.append(module.register_forward_pre_hook(_pre_forward_module_hook))
+
+        def _ort_run_after_backward_function(offload, sub_module):
+            if sub_module.ds_grads_remaining == 0:
+                self.post_sub_module_backward_function(sub_module)
+
+        def _ort_pre_forward_module_hook(module, inputs):
+            # print("enter _ort_pre_forward_module_hook", module, module.training)
+            # input = inputs
+            # input_count = len(input)
+            # if isinstance(input, torch.Tensor):
+            #     input_count = 1
+
+            if isinstance(inputs, torch.Tensor):
+                print("88888888888888888_ort_pre_forward_module_hook inputs type", type(inputs), type(module))
+            elif isinstance(inputs, (tuple, list)):
+                print("88888888888888888_ort_pre_forward_module_hook inputs type", [f"{type(ret)}-{str(ret.size()) + '-' + str(ret.dtype) if isinstance(ret, torch.Tensor) else ''}" for ret in inputs], type(module))
+                if any([not isinstance(ret, (torch.Tensor, type(None))) for ret in inputs]):
+                    print("888888888888888888888888#########################", module)
+
+
+                
+            elif isinstance(inputs, dict):
+                print("88888888888888888_ort_pre_forward_module_hook inputs type", {key: type(ret) for key, ret in inputs.items()}, type(module))
+
+
+            rets = ORTPreForwardwardFunction.apply(self, module, _ort_run_after_backward_function, *inputs)
+
+
+            if rets is None:
+                return
+
+            if isinstance(rets, torch.Tensor):
+                print("88888888888888888_ort_pre_forward_module_hook output rets type", type(rets), type(module))
+            elif isinstance(rets, (tuple, list)):
+                print("88888888888888888_ort_pre_forward_module_hook output rets type", [type(ret) for ret in rets], type(module))
+                if any([not isinstance(ret, (torch.Tensor, type(None))) for ret in rets]):
+                    print("888888888888888888888888#########################", type(module))
+
+
+            elif isinstance(rets, dict):
+                print("88888888888888888_ort_pre_forward_module_hook output rets type", {key: type(ret) for key, ret in rets.items()}, type(module))
+            if isinstance(rets, (tuple, list)) and len(rets) == 1:
+                return rets[0]
+            return rets 
+            # # import traceback
+            # # traceback.print_stack()
+            # if input_count == 1:
+            #     a = a[0]
+
+            # # print("exit _ort_pre_forward_module_hook", module, module.training, inputs,  a)
+            # return a
+        
+        self.forward_hooks.append(module.register_forward_pre_hook(_ort_pre_forward_module_hook))
 
         # Post forward hook
-        self.forward_hooks.append(module.register_forward_hook(_post_forward_module_hook))
+        # self.forward_hooks.append(module.register_forward_hook(_post_forward_module_hook))
 
-        # Pre backward hook
-        self.backward_hooks.append(module.register_forward_hook(_pre_backward_module_hook))
+        def _ort_run_before_backward_function(sub_module):
+            # print("enter _ort_run_before_backward_function", sub_module, sub_module.training)
+            # some models (e.g. Albert) may run multiple forwards on the same layer in a loop
+            # before doing backwards, so each backward will need a pre-fetch - using reference
+            # counting to support this scenario
+            #print(f"COUNTER before: {sub_module.applied_pre_backward_ref_cnt}")
+            if sub_module.applied_pre_backward_ref_cnt > 0:
+                self.pre_sub_module_backward_function(sub_module)
+                sub_module.applied_pre_backward_ref_cnt -= 1
+            #print(f"COUNTER after: {sub_module.applied_pre_backward_ref_cnt}")
+            # print("exit _ort_run_before_backward_function ", sub_module.training)
 
-        # post backward hook
-        self.backward_hooks.append(module.register_forward_pre_hook(_post_backward_module_hook))
+
+
+        class _TensorStub:
+            """Tensor stub class used to represent model's input or output"""
+
+            def __init__(
+                self, name: Optional[str] = None, dtype: Optional[str] = None, shape=None, shape_dims: Optional[int] = None,
+                tensor_idx = None
+            ):
+                self.name: Optional[str] = name
+                self.dtype: Optional[str] = dtype
+                self.shape = shape
+                self.shape_dims: Optional[int] = shape_dims  # r.g. rank.
+                self.tensor_idx = tensor_idx
+
+
+        _ModelInputOutputSchemaType = Union[
+            None,
+            str,
+            _TensorStub,
+            Sequence["_ModelInputOutputSchemaType"],
+            Mapping[str, "_ModelInputOutputSchemaType"],
+        ]
+
+
+        def _flatten_data_with_schema(data):
+            flatten_tensor_data = []
+            tensor_idx = [-1]
+            def _flatten_from_data(data):
+                if data is None:
+                    return data
+                elif isinstance(data, str):
+                    return data
+                elif isinstance(data, (int, bool, float)):
+                    return _TensorStub(dtype=data, shape_dims=0)
+                # Depth first traversal to iterate over the data to replace every tensor with a stub
+                elif isinstance(data, torch.Tensor):
+                    tensor_idx[0] += 1
+                    flatten_tensor_data.append(data)
+                    return _TensorStub(dtype=str(data.dtype), shape_dims=len(data.size()), tensor_idx=tensor_idx[0])
+
+                # Instead of replacing the tensor with a stub in the original user input, build the stubbed_schema
+                # from scratch from the user input.
+                stubbed_schema: Optional[_ModelInputOutputSchemaType] = None
+                if isinstance(data, abc.Sequence):
+                    sequence_type = type(data)
+                    stubbed_schema = [_flatten_from_data(val) for val in data]
+                    try:
+                        # namedtuple can be created by passing the list sequence to method _make
+                        stubbed_schema = sequence_type._make(stubbed_schema)
+                    except AttributeError:
+                        # If attribute error encountered, create the sequence directly
+                        stubbed_schema = sequence_type(stubbed_schema)
+                elif isinstance(data, abc.Mapping):
+                    dict_type = type(data)
+                    stubbed_schema = {key: _flatten_from_data(data[key]) for key in data}
+                    stubbed_schema = dict_type(**stubbed_schema)
+                else:
+                    raise RuntimeError(f"Unsupported data type: {type(data)}")
+                return stubbed_schema
+
+            schemas = _flatten_from_data(data)
+            return schemas, flatten_tensor_data
+
+        def _unflatten_data_from_schema(schema: Optional[_ModelInputOutputSchemaType], outputs):
+            """Follows the schema to generate an output that is expected by the user"""
+            import copy
+
+            def _replace_stub_with_tensor_value(schema, outputs):
+                # Recursively traverse across schema and replace all _TensorStub
+                # with torch.Tensor values from outputs following output_idx
+
+                if schema is None:
+                    return None
+                elif isinstance(schema, _TensorStub):
+                    out = outputs[schema.tensor_idx]
+                    return out
+
+                if isinstance(schema, abc.Sequence):
+                    sequence_type = type(schema)
+                    if hasattr(sequence_type, "_make"):  # namedtuple
+                        sequence_type = type(schema)
+                        schema = sequence_type._make(
+                            _replace_stub_with_tensor_value(uo, outputs) for uo in schema
+                        )
+                    else:
+                        schema = sequence_type(
+                            _replace_stub_with_tensor_value(uo, outputs) for uo in schema
+                        )
+                elif isinstance(schema, abc.Mapping):
+                    new_user_output = copy.copy(schema)
+                    for key in sorted(schema):
+                        new_user_output[key] = _replace_stub_with_tensor_value(new_user_output[key], outputs)
+                    schema = new_user_output
+                else:
+                    raise RuntimeError(f"Unsupported data type: {type(schema)}")
+
+                return schema
+
+            user_output = _replace_stub_with_tensor_value(schema, outputs)
+            return user_output
+
+
+        def _ort_post_forward_module_hook(module, inputs, outputs):
+            # print("enter _ort_post_forward_module_hook", module, module.training, outputs)
+            input = inputs
+            # output = outputs
+            if isinstance(input, torch.Tensor):
+                input = [input]
+
+            assert isinstance(input, (tuple, list))
+            # assert isinstance(output, (tuple, list))
+            input_and_output = []
+            for i in input:
+                input_and_output.append(i)
+
+
+            if not isinstance(outputs, (list, tuple, torch.Tensor)):
+                print("99999999999999_ort_post_forward_module_hook output type is: ", type(outputs))
+
+            schema, flatten_tensors = _flatten_data_with_schema(outputs)
+            input_and_output.extend(flatten_tensors)
+
+            # input_tensors, packed_non_tensors = split_non_tensors(input)
+            rets = ORTPostForwardwardFunction.apply(module, _post_forward_module_hook, _ort_run_before_backward_function, len(input), len(flatten_tensors), *input_and_output)
+            # print("exit _ort_post_forward_module_hook", module, module.training)
+
+            rets = _unflatten_data_from_schema(schema, rets)
+
+            if isinstance(rets, torch.Tensor):
+                print("99999999999999_ort_post_forward_module_hook output rets type", type(rets))
+            elif isinstance(rets, (tuple, list)):
+                print("99999999999999_ort_post_forward_module_hook output rets type", [type(ret) for ret in rets])
+                if any([not isinstance(ret, (torch.Tensor, type(None))) for ret in rets]):
+                    print("9999999999999999999999#########################", module)
+            elif isinstance(rets, dict):
+                print("99999999999999_ort_post_forward_module_hook output rets type", {key: type(ret) for key, ret in rets.items()})
+            
+            # if isinstance(rets, (tuple, list)) and len(rets) == 1:
+            #     return rets[0]
+            return rets 
+
+
+        self.forward_hooks.append(module.register_forward_hook(_ort_post_forward_module_hook))
+
+
+        # # Pre backward hook
+        # self.backward_hooks.append(module.register_forward_hook(_pre_backward_module_hook))
+
+        # # post backward hook
+        # self.backward_hooks.append(module.register_forward_pre_hook(_post_backward_module_hook))
+
 
     @torch.no_grad()
     def pre_sub_module_forward_function(self, sub_module):
@@ -486,6 +857,7 @@ class DeepSpeedZeRoOffload(object):
 
         global FWD_MODULE_STACK
         FWD_MODULE_STACK.append(sub_module)
+        # print("pre_sub_module_forward_function>> ", sub_module, len(FWD_MODULE_STACK))
 
         param_coordinator = self.get_param_coordinator(training=sub_module.training)
         param_coordinator.trace_prologue(sub_module)
