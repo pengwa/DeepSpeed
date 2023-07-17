@@ -1127,34 +1127,36 @@ class DeepSpeedZeRoOffload(object):
             if isinstance(module, ORTModule):
                 return
             # print("enter _ort_post_forward_module_hook", module, module.training, outputs)
-            input = inputs
-            # output = outputs
-            if isinstance(input, torch.Tensor):
-                input = [input]
+            # input = inputs
+            # # output = outputs
+            # if isinstance(input, torch.Tensor):
+            #     input = [input]
 
-            assert isinstance(input, (tuple, list))
-            # assert isinstance(output, (tuple, list))
-            input_and_output = []
-            for i in input:
-                input_and_output.append(i)
+            # assert isinstance(input, (tuple, list))
+            # # assert isinstance(output, (tuple, list))
+            # input_and_output = []
+            # for i in input:
+            #     input_and_output.append(i)
 
-            if not isinstance(outputs, (list, tuple, torch.Tensor)):
-                print(
-                    "99999999999999_ort_post_forward_module_hook output type is: ",
-                    type(outputs),
-                )
+            # if not isinstance(outputs, (list, tuple, torch.Tensor)):
+            #     print(
+            #         "99999999999999_ort_post_forward_module_hook output type is: ",
+            #         type(outputs),
+            #     )
 
-            schema, flatten_tensors = _flatten_data_with_schema(outputs)
-            input_and_output.extend(flatten_tensors)
+            input_schema, flatten_input_tensors = _flatten_data_with_schema(inputs)
+
+            schema, flatten_output_tensors = _flatten_data_with_schema(outputs)
+            # input_and_output.extend(flatten_tensors)
 
             # input_tensors, packed_non_tensors = split_non_tensors(input)
             rets = ORTPostForwardwardFunction.apply(
                 module,
                 _post_forward_module_hook,
                 _ort_run_before_backward_function,
-                len(input),
-                len(flatten_tensors),
-                *input_and_output,
+                len(flatten_input_tensors),
+                len(flatten_output_tensors),
+                *(flatten_input_tensors + flatten_output_tensors),
             )
             # print("exit _ort_post_forward_module_hook", module, module.training)
 
