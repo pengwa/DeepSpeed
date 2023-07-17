@@ -264,9 +264,11 @@ class ORTPreForwardwardFunction(torch.autograd.Function):
         ctx,
         offload,
         module,
+        pre_forward_function,
         post_backward_function,
         input_count,
         partition_param_count,
+        kwarg_tensor_count,
         *inputs_and_partitioned_parms,
     ):
         offload.pre_sub_module_forward_function(module)
@@ -285,12 +287,13 @@ class ORTPreForwardwardFunction(torch.autograd.Function):
         kwarg_tensors = inputs_and_partitioned_parms[
             partition_param_count + input_count :
         ]
+        assert len(kwarg_tensors) == kwarg_tensor_count
 
         ctx.module = module
         ctx.offload = offload
         ctx.post_backward_function = post_backward_function
         ctx.partitioned_params = partitioned_params
-        ctx.kwarg_tensor_count = len(kwarg_tensors)
+        ctx.kwarg_tensor_count = kwarg_tensor_count
 
         module.ds_grads_remaining = 0
 
@@ -298,40 +301,44 @@ class ORTPreForwardwardFunction(torch.autograd.Function):
         #     ctx.num_of_input = 0
         #     return None
 
-        def func(input_):
-            if input_.requires_grad:
-                # TODO SOME TIMES post backward does not seem to be triggered debug in detail
-                # Should only cause increase in memory not correctness issue
-                # if output.grad_fn.__class__.__name__ == 'ViewBackward':
-                #    ctx.view=True
-                #    print(f"Warning view tensor for input to module : {module.__class__.__name__}. Backward hooks may not trigger properly")
-                # assert len(module.parameters(recurse=False)), "The input tensor to the module is a view, and autograd Function or register_hook is not triggered with view tensors."
-                # if module.ds_grads_remaining == 0:
-                #    print(f"Before Forward: {ctx.module.__class__.__name__}")
-                module.ds_grads_remaining += 1
-            return input_.detach().requires_grad_(input_.requires_grad)
+        # def func(input_):
+        #     if input_.requires_grad:
+        #         # TODO SOME TIMES post backward does not seem to be triggered debug in detail
+        #         # Should only cause increase in memory not correctness issue
+        #         # if output.grad_fn.__class__.__name__ == 'ViewBackward':
+        #         #    ctx.view=True
+        #         #    print(f"Warning view tensor for input to module : {module.__class__.__name__}. Backward hooks may not trigger properly")
+        #         # assert len(module.parameters(recurse=False)), "The input tensor to the module is a view, and autograd Function or register_hook is not triggered with view tensors."
+        #         # if module.ds_grads_remaining == 0:
+        #         #    print(f"Before Forward: {ctx.module.__class__.__name__}")
+        #         module.ds_grads_remaining += 1
+        #     return input_.detach().requires_grad_(input_.requires_grad)
 
-        rets = _recursively_apply_to_tensors_only(module, func, inputs)
-        if not isinstance(rets, (tuple, list, dict, torch.Tensor)):
-            input_count = 0
-            rets = ()
-        elif isinstance(rets, torch.Tensor):
-            input_count = 1
-            rets = (rets,)
-        else:
-            input_count = len(rets)
+        # rets = _recursively_apply_to_tensors_only(module, func, inputs)
+        # if not isinstance(rets, (tuple, list, dict, torch.Tensor)):
+        #     input_count = 0
+        #     rets = ()
+        # elif isinstance(rets, torch.Tensor):
+        #     input_count = 1
+        #     rets = (rets,)
+        # else:
+        #     input_count = len(rets)
+
+        rets = ()
+        rets += tuple([pre_forward_function(module, input_) for input_ in inputs])
+
         ctx.num_of_input = input_count
-        if input_count == 0:
-            # pengwa: need return something instead of empty list, otherwise, torch export explains "Couldn't lower all tuples. prim::PythonOp"
-            rets = partitioned_params
-            for a in partitioned_params:
-                print(">>a.size(): ", a.size())
-        else:
-            rets += partitioned_params
-            for a in partitioned_params:
-                print("<<a.size(): ", a.size())
-
-        rets = rets + kwarg_tensors
+        # if input_count == 0:
+        #     # pengwa: need return something instead of empty list, otherwise, torch export explains "Couldn't lower all tuples. prim::PythonOp"
+        #     rets = partitioned_params
+        #     for a in partitioned_params:
+        #         print(">>a.size(): ", a.size())
+        # else:
+        #     rets += partitioned_params
+        #     for a in partitioned_params:
+        #         print("<<a.size(): ", a.size())
+        rets += partitioned_params
+        rets += kwarg_tensors
         assert len(rets) != 0
         # if len(rets) == 0:
         #     return None
@@ -358,6 +365,8 @@ class ORTPreForwardwardFunction(torch.autograd.Function):
 
         return (
             (
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -422,12 +431,18 @@ class ORTPostForwardwardFunction(torch.autograd.Function):
         module.applied_pre_backward_ref_cnt += 1
         # print(f"After Forward: {ctx.module.__class__.__name__}")
 
-        return _recursively_tensor_apply_func(
+        rets = _recursively_tensor_apply_func(
             lambda x: x.detach().requires_grad_(x.requires_grad)
             if x is not None
             else None,
             outputs,
         )
+
+        print(
+            "output of module " + module.__class__.__name__ + ": ",
+            [a.size() if isinstance(a, torch.Tensor) else a for a in rets],
+        )
+        return rets
         # if isinstance(outputs, torch.Tensor):
         #     return outputs.detach()
         # if isinstance(outputs, (tuple, list)):
@@ -780,51 +795,51 @@ class DeepSpeedZeRoOffload(object):
 
             # print("enter _ort_pre_forward_module_hook", module, module.training)
 
-            flatten_input_list = []
-            if isinstance(inputs, torch.Tensor):
-                flatten_input_list = [inputs]
-                print(
-                    "88888888888888888_ort_pre_forward_module_hook inputs type",
-                    type(inputs),
-                    type(module),
-                    inputs.dtype,
-                    inputs.size(),
-                )
-            elif isinstance(inputs, (tuple, list)):
-                print(
-                    "88888888888888888_ort_pre_forward_module_hook inputs type",
-                    [
-                        f"{type(ret)}-{str(ret.size()) + '-' + str(ret.dtype) + '-' + str(ret.requires_grad) if isinstance(ret, torch.Tensor) else ''}"
-                        for ret in inputs
-                    ],
-                    type(module),
-                )
-                if any(
-                    [not isinstance(ret, (torch.Tensor, type(None))) for ret in inputs]
-                ):
-                    raise RuntimeError(
-                        "Found non-tensor or non-None input in the input list."
-                    )
-                flatten_input_list = [ret for ret in inputs]
-            elif isinstance(inputs, dict):
-                print(
-                    "88888888888888888_ort_pre_forward_module_hook inputs type",
-                    {key: type(ret) for key, ret in inputs.items()},
-                    type(module),
-                )
-                if any(
-                    [
-                        not isinstance(ret, (torch.Tensor, type(None)))
-                        for ret in inputs.values()
-                    ]
-                ):
-                    raise RuntimeError(
-                        "Found non-tensor or non-None input in the input list."
-                    )
+            # flatten_input_list = []
+            # if isinstance(inputs, torch.Tensor):
+            #     flatten_input_list = [inputs]
+            #     print(
+            #         "88888888888888888_ort_pre_forward_module_hook inputs type",
+            #         type(inputs),
+            #         type(module),
+            #         inputs.dtype,
+            #         inputs.size(),
+            #     )
+            # elif isinstance(inputs, (tuple, list)):
+            #     print(
+            #         "88888888888888888_ort_pre_forward_module_hook inputs type",
+            #         [
+            #             f"{type(ret)}-{str(ret.size()) + '-' + str(ret.dtype) + '-' + str(ret.requires_grad) if isinstance(ret, torch.Tensor) else ''}"
+            #             for ret in inputs
+            #         ],
+            #         type(module),
+            #     )
+            #     if any(
+            #         [not isinstance(ret, (torch.Tensor, type(None))) for ret in inputs]
+            #     ):
+            #         raise RuntimeError(
+            #             "Found non-tensor or non-None input in the input list."
+            #         )
+            #     flatten_input_list = [ret for ret in inputs]
+            # elif isinstance(inputs, dict):
+            #     print(
+            #         "88888888888888888_ort_pre_forward_module_hook inputs type",
+            #         {key: type(ret) for key, ret in inputs.items()},
+            #         type(module),
+            #     )
+            #     if any(
+            #         [
+            #             not isinstance(ret, (torch.Tensor, type(None)))
+            #             for ret in inputs.values()
+            #         ]
+            #     ):
+            #         raise RuntimeError(
+            #             "Found non-tensor or non-None input in the input list."
+            #         )
 
-                flatten_input_list = [ret for ret in inputs.values()]
-            else:
-                raise RuntimeError("Unsupported inputs type")
+            #     flatten_input_list = [ret for ret in inputs.values()]
+            # else:
+            #     raise RuntimeError("Unsupported inputs type")
 
             params_to_fetch = frozenset(iter_params(module))
             partitioned_params = []
@@ -834,27 +849,50 @@ class DeepSpeedZeRoOffload(object):
 
             partitioned_param_count = len(partitioned_params)
 
+            p_schema, p_flatten_tensors = _flatten_data_with_schema(inputs)
+            p_count = len(p_flatten_tensors)
+
             k_schema, k_flatten_tensors = _flatten_data_with_schema(kwargs)
             k_count = len(k_flatten_tensors)
 
-            hook_input_count = len(flatten_input_list)
+            # hook_input_count = len(flatten_input_list)
 
             print(
-                "count of flatten input for ORTPreForwardwardFunction.apply: count of hook_input_count:"
-                + str(hook_input_count)
+                "count of flatten input for ORTPreForwardwardFunction.apply: count of p_flatten_tensors:"
+                + str(p_count)
                 + ", count of partitioned params: "
                 + str(partitioned_param_count)
                 + ", count of kwargs: "
                 + str(k_count)
             )
+
+            def _ort_run_before_forward_function(m, input_):
+                if input_.requires_grad:
+                    # TODO SOME TIMES post backward does not seem to be triggered debug in detail
+                    # Should only cause increase in memory not correctness issue
+                    # if output.grad_fn.__class__.__name__ == 'ViewBackward':
+                    #    ctx.view=True
+                    #    print(f"Warning view tensor for input to module : {module.__class__.__name__}. Backward hooks may not trigger properly")
+                    # assert len(module.parameters(recurse=False)), "The input tensor to the module is a view, and autograd Function or register_hook is not triggered with view tensors."
+                    # if module.ds_grads_remaining == 0:
+                    #    print(f"Before Forward: {ctx.module.__class__.__name__}")
+                    m.ds_grads_remaining += 1
+                return input_.detach().requires_grad_(input_.requires_grad)
+
             rets = ORTPreForwardwardFunction.apply(
                 self,
                 module,
+                _ort_run_before_forward_function,
                 _ort_run_after_backward_function,
-                hook_input_count,
+                p_count,
                 partitioned_param_count,
-                *(flatten_input_list + partitioned_params + k_flatten_tensors),
+                k_count,
+                *(p_flatten_tensors + partitioned_params + k_flatten_tensors),
             )
+
+            p_rets = rets[:p_count]
+            k_rets = rets[-k_count:]
+
             print(
                 "count of flatten output from ORTPreForwardwardFunction.apply: "
                 + str(len(rets))
@@ -862,7 +900,8 @@ class DeepSpeedZeRoOffload(object):
 
             assert rets is not None and len(rets) > 0
 
-            k_rets = _unflatten_data_from_schema(k_schema, rets[-k_count:])
+            # p_rets = _unflatten_data_from_schema(p_schema, p_rets)
+            k_rets = _unflatten_data_from_schema(k_schema, k_rets)
 
             # print(inputs, kwargs)
             # print(rets[:hook_input_count], k_rets)
@@ -877,58 +916,58 @@ class DeepSpeedZeRoOffload(object):
             #     return None, k_rets
             #     # return rets + flatten_input_list
 
-            rets = rets[:hook_input_count]
-            if len(rets) == 0:
+            if len(p_rets) == 0:
                 print(
                     "_ort_pre_forward_module_hook complete for module "
                     + module.__class__.__name__
                     + " with no output2"
                 )
-                if isinstance(rets, torch.Tensor):
-                    rets = [rets]
+                if isinstance(p_rets, torch.Tensor):
+                    p_rets = [p_rets]
 
-                if len(rets) != len(flatten_input_list):
-                    print(
-                        f"{len(rets)} != {len(flatten_input_list)}",
-                        [type(r) for r in flatten_input_list],
-                    )
-                return rets, k_rets
+                # if len(p_rets) != len(flatten_input_list):
+                #     print(
+                #         f"{len(p_rets)} != {len(flatten_input_list)}",
+                #         [type(r) for r in flatten_input_list],
+                #     )
+                return p_rets, k_rets
 
-            if isinstance(rets, torch.Tensor):
+            if isinstance(p_rets, torch.Tensor):
                 print(
                     "88888888888888888_ort_pre_forward_module_hook output rets type",
-                    type(rets),
+                    type(p_rets),
                     type(module),
                 )
-            elif isinstance(rets, (tuple, list)):
+            elif isinstance(p_rets, (tuple, list)):
                 print(
                     "88888888888888888_ort_pre_forward_module_hook output rets type",
                     [
                         f"{type(ret)}-{str(ret.size()) + '-' + str(ret.dtype) + '-' + str(ret.requires_grad) if isinstance(ret, torch.Tensor) else ''}"
-                        for ret in rets
+                        for ret in p_rets
                     ],
                     type(module),
                 )
                 if any(
-                    [not isinstance(ret, (torch.Tensor, type(None))) for ret in rets]
+                    [not isinstance(ret, (torch.Tensor, type(None))) for ret in p_rets]
                 ):
                     print(
                         "888888888888888888888888#########################",
                         type(module),
                     )
-            elif isinstance(rets, dict):
+            elif isinstance(p_rets, dict):
                 print(
                     "88888888888888888_ort_pre_forward_module_hook output rets type",
-                    {key: type(ret) for key, ret in rets.items()},
+                    {key: type(ret) for key, ret in p_rets.items()},
                     type(module),
                 )
-            if isinstance(rets, (tuple, list)) and len(rets) == 1:
+            if isinstance(p_rets, (tuple, list)) and len(p_rets) == 1:
                 print(
                     "88888888888888888888 exist with single postional output ",
-                    rets[0].size(),
+                    p_rets[0].size(),
                 )
-                return rets, k_rets
-            return rets, k_rets
+                print(k_rets)
+                return p_rets, k_rets
+            return p_rets, k_rets
             # # import traceback
             # # traceback.print_stack()
             # if input_count == 1:
