@@ -128,6 +128,128 @@ def _apply_forward_and_backward_to_tensors_only(
         return outputs
 
 
+class _TensorStub:
+    """Tensor stub class used to represent model's input or output"""
+
+    def __init__(
+        self,
+        name: Optional[str] = None,
+        dtype: Optional[str] = None,
+        shape=None,
+        shape_dims: Optional[int] = None,
+        tensor_idx=None,
+    ):
+        self.name: Optional[str] = name
+        self.dtype: Optional[str] = dtype
+        self.shape = shape
+        self.shape_dims: Optional[int] = shape_dims  # r.g. rank.
+        self.tensor_idx = tensor_idx
+
+
+_ModelInputOutputSchemaType = Union[
+    None,
+    str,
+    _TensorStub,
+    Sequence["_ModelInputOutputSchemaType"],
+    Mapping[str, "_ModelInputOutputSchemaType"],
+]
+
+
+def _flatten_data_with_schema(data):
+    flatten_tensor_data = []
+    tensor_idx = [-1]
+
+    def _flatten_from_data(data):
+        if data is None:
+            return data
+        elif isinstance(data, str):
+            return data
+        elif isinstance(data, (int, bool, float)):
+            # tensor_idx[0] += 1
+            # flatten_tensor_data.append(data)
+            # return _TensorStub(
+            #     dtype=data, shape_dims=0, tensor_idx=tensor_idx[0]
+            # )
+            return data
+        # Depth first traversal to iterate over the data to replace every tensor with a stub
+        elif isinstance(data, torch.Tensor):
+            tensor_idx[0] += 1
+            flatten_tensor_data.append(data)
+            return _TensorStub(
+                dtype=str(data.dtype),
+                shape_dims=len(data.size()),
+                tensor_idx=tensor_idx[0],
+            )
+
+        # Instead of replacing the tensor with a stub in the original user input, build the stubbed_schema
+        # from scratch from the user input.
+        stubbed_schema: Optional[_ModelInputOutputSchemaType] = None
+        if isinstance(data, abc.Sequence):
+            sequence_type = type(data)
+            stubbed_schema = [_flatten_from_data(val) for val in data]
+            try:
+                # namedtuple can be created by passing the list sequence to method _make
+                stubbed_schema = sequence_type._make(stubbed_schema)
+            except AttributeError:
+                # If attribute error encountered, create the sequence directly
+                stubbed_schema = sequence_type(stubbed_schema)
+        elif isinstance(data, abc.Mapping):
+            dict_type = type(data)
+            stubbed_schema = {key: _flatten_from_data(data[key]) for key in data}
+            stubbed_schema = dict_type(**stubbed_schema)
+        else:
+            raise RuntimeError(f"Unsupported data type: {type(data)}")
+        return stubbed_schema
+
+    schemas = _flatten_from_data(data)
+    return schemas, flatten_tensor_data
+
+
+def _unflatten_data_from_schema(schema: Optional[_ModelInputOutputSchemaType], outputs):
+    """Follows the schema to generate an output that is expected by the user"""
+    import copy
+
+    def _replace_stub_with_tensor_value(schema, outputs):
+        # Recursively traverse across schema and replace all _TensorStub
+        # with torch.Tensor values from outputs following output_idx
+
+        if schema is None:
+            return None
+        elif isinstance(schema, str):
+            return schema
+        elif isinstance(schema, (int, bool, float)):
+            return schema
+        elif isinstance(schema, _TensorStub):
+            out = outputs[schema.tensor_idx]
+            return out
+
+        if isinstance(schema, abc.Sequence):
+            sequence_type = type(schema)
+            if hasattr(sequence_type, "_make"):  # namedtuple
+                sequence_type = type(schema)
+                schema = sequence_type._make(
+                    _replace_stub_with_tensor_value(uo, outputs) for uo in schema
+                )
+            else:
+                schema = sequence_type(
+                    _replace_stub_with_tensor_value(uo, outputs) for uo in schema
+                )
+        elif isinstance(schema, abc.Mapping):
+            new_user_output = copy.copy(schema)
+            for key in sorted(schema):
+                new_user_output[key] = _replace_stub_with_tensor_value(
+                    new_user_output[key], outputs
+                )
+            schema = new_user_output
+        else:
+            raise RuntimeError(f"Unsupported data type: {type(schema)}")
+
+        return schema
+
+    user_output = _replace_stub_with_tensor_value(schema, outputs)
+    return user_output
+
+
 class ZeROOrderedDict(OrderedDict):
     def __init__(self, parent_module, *args, **kwargs):
         """A replacement for ``collections.OrderedDict`` to detect external ZeRO params.
@@ -338,7 +460,21 @@ class ORTPreForwardwardFunction(torch.autograd.Function):
         #     for a in partitioned_params:
         #         print("<<a.size(): ", a.size())
         rets += partitioned_params
+
+        if len(partitioned_params) > 0:
+            ctx.p_data_type = partitioned_params[0].dtype
+            ctx.p_device = partitioned_params[0].device
+
         rets += kwarg_tensors
+
+        if len(kwarg_tensors) > 0:
+            ctx.data_type = kwarg_tensors[0].dtype
+            ctx.device = kwarg_tensors[0].device
+
+        print(
+            f"By end of ORTPreForwardwardFunction>>Forward: {ctx.module.__class__.__name__}, ",
+            [r.requires_grad for r in rets],
+        )
         assert len(rets) != 0
         # if len(rets) == 0:
         #     return None
@@ -349,6 +485,9 @@ class ORTPreForwardwardFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *args):
+        print(
+            f"Before ORTPreForwardwardFunction>>Backward: {ctx.module.__class__.__name__}"
+        )
         # ctx.module.ds_grads_remaining = ctx.module.ds_grads_remaining - 1
         # if ctx.module.ds_grads_remaining == 0:
         ctx.module.ds_grads_remaining = 0  # pengwa
@@ -363,19 +502,29 @@ class ORTPreForwardwardFunction(torch.autograd.Function):
             # print(f"Before Backward: {ctx.module.__class__.__name__}")
             ctx.post_backward_function(ctx.offload, ctx.module)
 
-        return (
-            (
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            + args[: ctx.num_of_input]
-            + (None,) * (len(ctx.partitioned_params) + ctx.kwarg_tensor_count)
-        )
+        t = (
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ) + args
+
+        # if len(ctx.partitioned_params) > 0:
+        #     t += (torch.empty(0, dtype=ctx.p_data_type, device=ctx.p_device),) * len(
+        #         ctx.partitioned_params
+        #     )
+
+        #     t += args[ctx.num_of_input : ctx.num_of_input + len(ctx.partitioned_params)]
+
+        # if ctx.kwarg_tensor_count > 0:
+        #     t += (
+        #         torch.zeros(1, device=ctx.device, dtype=ctx.data_type),
+        #     ) * ctx.kwarg_tensor_count
+
+        return t
 
 
 def _recursively_tensor_apply_func(function, outputs):
@@ -419,9 +568,10 @@ class ORTPostForwardwardFunction(torch.autograd.Function):
         output_count,
         *inputs_and_outputs,
     ):
-        inputs = inputs_and_outputs[:input_count]
-        outputs = inputs_and_outputs[input_count:]
-        post_forward_function(module, inputs, outputs)
+        # inputs = inputs_and_outputs[:input_count]
+        # outputs = inputs_and_outputs[input_count:]
+        outputs = inputs_and_outputs
+        post_forward_function(module, outputs)
 
         ctx.module = module
         ctx.pre_backward_function = pre_backward_function
@@ -437,6 +587,8 @@ class ORTPostForwardwardFunction(torch.autograd.Function):
             else None,
             outputs,
         )
+
+        ctx.data_type = outputs[0].dtype
 
         print(
             "output of module " + module.__class__.__name__ + ": ",
@@ -457,21 +609,38 @@ class ORTPostForwardwardFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, *args):
-        # print(f"Before Backward: {ctx.module.__class__.__name__}")
+        print(
+            f"Before ORTPostForwardwardFunction>>Backward: {ctx.module.__class__.__name__}"
+        )
         ctx.pre_backward_function(ctx.module)
-        return (None, None, None, None, None) + (None,) * ctx.input_count + args
+
+        new_args = []
+        for i in range(len(args)):
+            if args[i] is None:  # in case some grad input are None
+                new_args.append(
+                    torch.zeros(1, device=ctx.module.device, dtype=ctx.data_type)
+                )
+            else:
+                new_args.append(args[i])
+
+        return (None, None, None, None, None) + tuple(
+            new_args
+        )  # + (None,) * ctx.input_count
 
 
 class ORTFinalForwardCleanupFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, offload, is_grad_enabled):
+    def forward(ctx, offload, is_grad_enabled, output_count, *args):
         if not is_grad_enabled:
             offload.get_param_coordinator(training=False).reset_step()
-        return None
+
+        ctx.num_output = output_count
+        return args
 
     @staticmethod
     def backward(ctx, *args):
-        return (None, None)
+        print("??????????????????")
+        return (None, None, None) + args
 
 
 class DeepSpeedZeRoOffload(object):
@@ -627,15 +796,33 @@ class DeepSpeedZeRoOffload(object):
 
         # reset step if in inference mode
         @instrument_w_nvtx
-        def _end_of_forward_hook(module, *args):
+        def _end_of_forward_hook(module, inputs, outputs):
             # if not torch._C.is_grad_enabled():
             #     self.get_param_coordinator(training=False).reset_step()
 
-            ORTFinalForwardCleanupFunction.apply(self, torch._C.is_grad_enabled())
+            print("end of forward hook >>>>>>>>>>>>>")
+            p_schema, p_flatten_tensors = _flatten_data_with_schema(outputs)
+            rets = ORTFinalForwardCleanupFunction.apply(
+                self,
+                torch._C.is_grad_enabled(),
+                len(p_flatten_tensors),
+                *p_flatten_tensors,
+            )
+
+            rets = _unflatten_data_from_schema(p_schema, rets)
+
+            if isinstance(rets, (tuple, list)) and len(rets) == 1:
+                rets = rets[0]
+
+            print("end of forward hooks results", rets)
+
+            return rets
 
         # likely one of them should be enough but just to be safe
+        # self._register_hooks_recursively(self.module)
         self._register_hooks_recursively(self.module)
-        self.module.register_forward_hook(_end_of_forward_hook)
+        # self.module.register_forward_hook(_end_of_forward_hook)
+        self.module._torch_module.module.register_forward_hook(_end_of_forward_hook)
 
         # Add top module to stack trace
         global FWD_MODULE_STACK
@@ -678,7 +865,7 @@ class DeepSpeedZeRoOffload(object):
             self.pre_sub_module_forward_function(module)
 
         @instrument_w_nvtx
-        def _post_forward_module_hook(module, input, output):
+        def _post_forward_module_hook(module, output):
             global FWD_MODULE_STACK
             print(
                 f"pop module from FWD_MODULE_STACK: {module.__class__.__name__} : {module.id}"
@@ -997,130 +1184,6 @@ class DeepSpeedZeRoOffload(object):
             # print(f"COUNTER after: {sub_module.applied_pre_backward_ref_cnt}")
             # print("exit _ort_run_before_backward_function ", sub_module.training)
 
-        class _TensorStub:
-            """Tensor stub class used to represent model's input or output"""
-
-            def __init__(
-                self,
-                name: Optional[str] = None,
-                dtype: Optional[str] = None,
-                shape=None,
-                shape_dims: Optional[int] = None,
-                tensor_idx=None,
-            ):
-                self.name: Optional[str] = name
-                self.dtype: Optional[str] = dtype
-                self.shape = shape
-                self.shape_dims: Optional[int] = shape_dims  # r.g. rank.
-                self.tensor_idx = tensor_idx
-
-        _ModelInputOutputSchemaType = Union[
-            None,
-            str,
-            _TensorStub,
-            Sequence["_ModelInputOutputSchemaType"],
-            Mapping[str, "_ModelInputOutputSchemaType"],
-        ]
-
-        def _flatten_data_with_schema(data):
-            flatten_tensor_data = []
-            tensor_idx = [-1]
-
-            def _flatten_from_data(data):
-                if data is None:
-                    return data
-                elif isinstance(data, str):
-                    return data
-                elif isinstance(data, (int, bool, float)):
-                    # tensor_idx[0] += 1
-                    # flatten_tensor_data.append(data)
-                    # return _TensorStub(
-                    #     dtype=data, shape_dims=0, tensor_idx=tensor_idx[0]
-                    # )
-                    return data
-                # Depth first traversal to iterate over the data to replace every tensor with a stub
-                elif isinstance(data, torch.Tensor):
-                    tensor_idx[0] += 1
-                    flatten_tensor_data.append(data)
-                    return _TensorStub(
-                        dtype=str(data.dtype),
-                        shape_dims=len(data.size()),
-                        tensor_idx=tensor_idx[0],
-                    )
-
-                # Instead of replacing the tensor with a stub in the original user input, build the stubbed_schema
-                # from scratch from the user input.
-                stubbed_schema: Optional[_ModelInputOutputSchemaType] = None
-                if isinstance(data, abc.Sequence):
-                    sequence_type = type(data)
-                    stubbed_schema = [_flatten_from_data(val) for val in data]
-                    try:
-                        # namedtuple can be created by passing the list sequence to method _make
-                        stubbed_schema = sequence_type._make(stubbed_schema)
-                    except AttributeError:
-                        # If attribute error encountered, create the sequence directly
-                        stubbed_schema = sequence_type(stubbed_schema)
-                elif isinstance(data, abc.Mapping):
-                    dict_type = type(data)
-                    stubbed_schema = {
-                        key: _flatten_from_data(data[key]) for key in data
-                    }
-                    stubbed_schema = dict_type(**stubbed_schema)
-                else:
-                    raise RuntimeError(f"Unsupported data type: {type(data)}")
-                return stubbed_schema
-
-            schemas = _flatten_from_data(data)
-            return schemas, flatten_tensor_data
-
-        def _unflatten_data_from_schema(
-            schema: Optional[_ModelInputOutputSchemaType], outputs
-        ):
-            """Follows the schema to generate an output that is expected by the user"""
-            import copy
-
-            def _replace_stub_with_tensor_value(schema, outputs):
-                # Recursively traverse across schema and replace all _TensorStub
-                # with torch.Tensor values from outputs following output_idx
-
-                if schema is None:
-                    return None
-                elif isinstance(schema, str):
-                    return schema
-                elif isinstance(schema, (int, bool, float)):
-                    return schema
-                elif isinstance(schema, _TensorStub):
-                    out = outputs[schema.tensor_idx]
-                    return out
-
-                if isinstance(schema, abc.Sequence):
-                    sequence_type = type(schema)
-                    if hasattr(sequence_type, "_make"):  # namedtuple
-                        sequence_type = type(schema)
-                        schema = sequence_type._make(
-                            _replace_stub_with_tensor_value(uo, outputs)
-                            for uo in schema
-                        )
-                    else:
-                        schema = sequence_type(
-                            _replace_stub_with_tensor_value(uo, outputs)
-                            for uo in schema
-                        )
-                elif isinstance(schema, abc.Mapping):
-                    new_user_output = copy.copy(schema)
-                    for key in sorted(schema):
-                        new_user_output[key] = _replace_stub_with_tensor_value(
-                            new_user_output[key], outputs
-                        )
-                    schema = new_user_output
-                else:
-                    raise RuntimeError(f"Unsupported data type: {type(schema)}")
-
-                return schema
-
-            user_output = _replace_stub_with_tensor_value(schema, outputs)
-            return user_output
-
         def _ort_post_forward_module_hook(module, inputs, outputs):
             from onnxruntime.training.ortmodule import ORTModule
 
@@ -1145,6 +1208,7 @@ class DeepSpeedZeRoOffload(object):
             #     )
 
             input_schema, flatten_input_tensors = _flatten_data_with_schema(inputs)
+            p_input_count = len(flatten_input_tensors)
 
             schema, flatten_output_tensors = _flatten_data_with_schema(outputs)
             # input_and_output.extend(flatten_tensors)
@@ -1154,9 +1218,9 @@ class DeepSpeedZeRoOffload(object):
                 module,
                 _post_forward_module_hook,
                 _ort_run_before_backward_function,
-                len(flatten_input_tensors),
+                p_input_count,
                 len(flatten_output_tensors),
-                *(flatten_input_tensors + flatten_output_tensors),
+                *(flatten_output_tensors),
             )
             # print("exit _ort_post_forward_module_hook", module, module.training)
 

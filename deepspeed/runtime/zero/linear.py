@@ -3,17 +3,17 @@
 
 # DeepSpeed Team
 
-#Linear Module to use with ZeRO Stage 3 to allow for parameter memory release
-#after the module execution during forward
-#Instead of saving variables using save_for_backward, we save variable ids
-#Allowing us to retrieve the variable without creating pointer to it
-#Which allows for underlying tensor to be garbage collected
-#When partitioned as needed by the Zero Stage 3 optimizer
-#TODO instead of patching Linear module, we could patch the ctx.save_for_backward
-#ctx.saved_tensors so that this approach works for all nn modules that are built upon
-#torch.nn.function. However the issue is that many modules uses C++ implementations
-#which does not have pytorch implementation. Eg torch.addmm which acts as a functional
-#when implemented outside of torch.autograd.Function
+# Linear Module to use with ZeRO Stage 3 to allow for parameter memory release
+# after the module execution during forward
+# Instead of saving variables using save_for_backward, we save variable ids
+# Allowing us to retrieve the variable without creating pointer to it
+# Which allows for underlying tensor to be garbage collected
+# When partitioned as needed by the Zero Stage 3 optimizer
+# TODO instead of patching Linear module, we could patch the ctx.save_for_backward
+# ctx.saved_tensors so that this approach works for all nn modules that are built upon
+# torch.nn.function. However the issue is that many modules uses C++ implementations
+# which does not have pytorch implementation. Eg torch.addmm which acts as a functional
+# when implemented outside of torch.autograd.Function
 
 import math
 
@@ -41,13 +41,11 @@ except (ImportError, AttributeError) as exp:
 
 
 class LinearFunctionForZeroStage3(torch.autograd.Function):
-
     # Note that both forward and backward are @staticmethods
     @staticmethod
     @autocast_custom_fwd
     # bias is an optional argument
     def forward(ctx, input, weight, bias=None):
-
         ctx.save_for_backward(input, weight, bias)
 
         if input.dim() == 2 and bias is not None:
@@ -74,36 +72,65 @@ class LinearFunctionForZeroStage3(torch.autograd.Function):
 
         grad_input = grad_weight = grad_bias = None
 
-        #print(f"backward shaped grad_output {grad_output.shape}, input {input.shape}, weight {weight.shape} and bias {bias.shape if bias is not None else None}")
+        # print(f"backward shaped grad_output {grad_output.shape}, input {input.shape}, weight {weight.shape} and bias {bias.shape if bias is not None else None}")
         # These needs_input_grad checks are optional and there only to
         # improve efficiency. If you want to make your code simpler, you can
         # skip them. Returning gradients for inputs that don't require it is
         # not an error.
         if ctx.needs_input_grad[0]:
-            #print(f"Computing grad input weight {weight.shape} grad_output {grad_output.shape}")
+            # print(f"Computing grad input weight {weight.shape} grad_output {grad_output.shape}")
             grad_input = grad_output.matmul(weight)
-            #print(f"Computed grad input {grad_input.shape}")
+            # print(f"Computed grad input {grad_input.shape}")
         if ctx.needs_input_grad[1]:
-            #print("Computing grad weight")
+            # print("Computing grad weight")
             dim = grad_output.dim()
             if dim > 2:
-                grad_weight = grad_output.reshape(-1,
-                                                  grad_output.shape[-1]).t().matmul(input.reshape(-1, input.shape[-1]))
+                grad_weight = (
+                    grad_output.reshape(-1, grad_output.shape[-1])
+                    .t()
+                    .matmul(input.reshape(-1, input.shape[-1]))
+                )
             else:
                 grad_weight = grad_output.t().matmul(input)
-            #print(f"Computed grad weight grad_weight {grad_weight.shape}")
+            # print(f"Computed grad weight grad_weight {grad_weight.shape}")
         if bias is not None and ctx.needs_input_grad[2]:
-            #print("Computing grad bias")
+            # print("Computing grad bias")
             grad_bias = grad_output.sum(0)
-            #print("Done computing grad bias")
-            #print("needs bias")
-        #print(f"backward shaped grad_input {grad_input.shape}, grad_weight {grad_weight.shape}, grad_bias {grad_bias.shape if grad_bias is not None else None}")
+            # print("Done computing grad bias")
+            # print("needs bias")
+        # print(f"backward shaped grad_input {grad_input.shape}, grad_weight {grad_weight.shape}, grad_bias {grad_bias.shape if grad_bias is not None else None}")
         return grad_input, grad_weight, grad_bias
 
 
 def zero3_linear_wrap(input, weight, bias=None):
     if bias is None:
-        return LinearFunctionForZeroStage3.apply(input, weight)
+        """
+                File "/bert_ort/pengwa/py3.8/lib/python3.8/site-packages/transformers/trainer.py", line 2751, in training_step
+            loss = self.deepspeed.backward(loss)
+          File "/bert_ort/pengwa/deepspeed/deepspeed/utils/nvtx.py", line 15, in wrapped_fn
+            ret_val = func(*args, **kwargs)
+          File "/bert_ort/pengwa/deepspeed/deepspeed/runtime/engine.py", line 1895, in backward
+            self.optimizer.backward(loss, retain_graph=retain_graph)
+          File "/bert_ort/pengwa/deepspeed/deepspeed/utils/nvtx.py", line 15, in wrapped_fn
+            ret_val = func(*args, **kwargs)
+          File "/bert_ort/pengwa/deepspeed/deepspeed/runtime/zero/stage3.py", line 2041, in backward
+            self.loss_scaler.backward(loss.float(), retain_graph=retain_graph)
+          File "/bert_ort/pengwa/deepspeed/deepspeed/runtime/fp16/loss_scaler.py", line 63, in backward
+            scaled_loss.backward(retain_graph=retain_graph)
+          File "/bert_ort/pengwa/py3.8/lib/python3.8/site-packages/torch/_tensor.py", line 491, in backward
+            torch.autograd.backward(
+          File "/bert_ort/pengwa/py3.8/lib/python3.8/site-packages/torch/autograd/__init__.py", line 204, in backward
+            Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+          File "/bert_ort/pengwa/py3.8/lib/python3.8/site-packages/torch/autograd/function.py", line 274, in apply
+            return user_fn(self, *args)
+          File "/bert_ort/pengwa/py3.8/lib/python3.8/site-packages/onnxruntime/training/ortmodule/_training_manager.py", line 193, in backward
+            self._execution_agent.run_backward(backward_inputs, backward_outputs, ctx.run_info.state)
+          File "/bert_ort/pengwa/py3.8/lib/python3.8/site-packages/onnxruntime/training/ortmodule/_execution_agent.py", line 163, in run_backward
+            self._training_agent.run_backward(feeds, fetches, state)
+        RuntimeError: Error in backward pass execution: Non-zero status code returned while running PythonOpGrad node. Name:'/_original_module/_original_model/embed_out/PythonOp_Grad/PythonOpGrad_0' Status Message: /bert_ort/pengwa/ort5/orttraining/orttraining/training_ops/cpu/torch/torch_custom_function_kernel_base.cc:280 void onnxruntime::contrib::PythonOpGradBase::SetOutputs(onnxruntime::OpKernelContext*, std::vector<OrtValue>&) const output_convention_.size() == returned_ortvalues.size() was false. backward output count mismatch. output_convention_.size(): 2, returned_ortvalues.size(): 3
+
+        """
+        return LinearFunctionForZeroStage3.apply(input, weight, None)
     else:
         return LinearFunctionForZeroStage3.apply(input, weight, bias)
 
@@ -143,7 +170,7 @@ class LinearModuleForZeroStage3(Module):
         >>> print(output.size())
         torch.Size([128, 30])
     """
-    __constants__ = ['in_features', 'out_features']
+    __constants__ = ["in_features", "out_features"]
     in_features: int
     out_features: int
     weight: Tensor
@@ -157,7 +184,7 @@ class LinearModuleForZeroStage3(Module):
         if bias:
             self.bias = Parameter(torch.Tensor(out_features))
         else:
-            self.register_parameter('bias', None)
+            self.register_parameter("bias", None)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -171,5 +198,6 @@ class LinearModuleForZeroStage3(Module):
         return LinearFunctionForZeroStage3.apply(input, self.weight, self.bias)
 
     def extra_repr(self) -> str:
-        return 'in_features={}, out_features={}, bias={}'.format(self.in_features, self.out_features, self.bias
-                                                                 is not None)
+        return "in_features={}, out_features={}, bias={}".format(
+            self.in_features, self.out_features, self.bias is not None
+        )
