@@ -45,7 +45,7 @@ class LinearFunctionForZeroStage3(torch.autograd.Function):
     @staticmethod
     @autocast_custom_fwd
     # bias is an optional argument
-    def forward(ctx, input, weight, bias=None):
+    def forward(ctx, input, weight, bias):
         ctx.save_for_backward(input, weight, bias)
 
         if input.dim() == 2 and bias is not None:
@@ -56,7 +56,14 @@ class LinearFunctionForZeroStage3(torch.autograd.Function):
             if bias is not None:
                 output += bias
             ret = output
-
+        print(
+            "LinearFunctionForZeroStage3 weight.shape: ",
+            weight.shape,
+            ", bias.shape: ",
+            bias.shape if bias is not None else None,
+            ", input.shape: ",
+            input.shape,
+        )
         return ret
 
     # This function has only a single output, so it gets only one gradient
@@ -77,11 +84,11 @@ class LinearFunctionForZeroStage3(torch.autograd.Function):
         # improve efficiency. If you want to make your code simpler, you can
         # skip them. Returning gradients for inputs that don't require it is
         # not an error.
-        if ctx.needs_input_grad[0]:
+        if ctx.needs_input_grad[0] and True:
             # print(f"Computing grad input weight {weight.shape} grad_output {grad_output.shape}")
             grad_input = grad_output.matmul(weight)
             # print(f"Computed grad input {grad_input.shape}")
-        if ctx.needs_input_grad[1]:
+        if ctx.needs_input_grad[1] and True:
             # print("Computing grad weight")
             dim = grad_output.dim()
             if dim > 2:
@@ -93,12 +100,16 @@ class LinearFunctionForZeroStage3(torch.autograd.Function):
             else:
                 grad_weight = grad_output.t().matmul(input)
             # print(f"Computed grad weight grad_weight {grad_weight.shape}")
-        if bias is not None and ctx.needs_input_grad[2]:
+        # if bias is not None and ctx.needs_input_grad[2]:
+        if bias is not None:
             # print("Computing grad bias")
-            grad_bias = grad_output.sum(0)
+            dims = [i for i in range(grad_output.dim() - 1)]
+            grad_bias = grad_output.sum(dims)
             # print("Done computing grad bias")
             # print("needs bias")
-        # print(f"backward shaped grad_input {grad_input.shape}, grad_weight {grad_weight.shape}, grad_bias {grad_bias.shape if grad_bias is not None else None}")
+        print(
+            f"backward shaped grad_input {grad_input.shape}, grad_weight {grad_weight.shape}, grad_bias {grad_bias.shape if grad_bias is not None else None}, grad_output {grad_output.shape}"
+        )
         return grad_input, grad_weight, grad_bias
 
 

@@ -21,6 +21,7 @@ from deepspeed import comm as dist
 from deepspeed.accelerator import get_accelerator
 
 FWD_MODULE_STACK = list()
+from onnxruntime.training.ortmodule import ORTModule
 
 
 def is_builtin_type(obj):
@@ -405,6 +406,9 @@ class ORTPreForwardwardFunction(torch.autograd.Function):
             ]
 
         partitioned_params = module_to_param_dict[module]
+        # partitioned_params = tuple(
+        #     [p.detach().requires_grad_(p.requires_grad) for p in partitioned_params]
+        # )
 
         kwarg_tensors = inputs_and_partitioned_parms[
             partition_param_count + input_count :
@@ -450,16 +454,10 @@ class ORTPreForwardwardFunction(torch.autograd.Function):
         rets += tuple([pre_forward_function(module, input_) for input_ in inputs])
 
         ctx.num_of_input = input_count
-        # if input_count == 0:
-        #     # pengwa: need return something instead of empty list, otherwise, torch export explains "Couldn't lower all tuples. prim::PythonOp"
-        #     rets = partitioned_params
-        #     for a in partitioned_params:
-        #         print(">>a.size(): ", a.size())
-        # else:
-        #     rets += partitioned_params
-        #     for a in partitioned_params:
-        #         print("<<a.size(): ", a.size())
-        rets += partitioned_params
+
+        rets += tuple(
+            [p.detach().requires_grad_(p.requires_grad) for p in partitioned_params]
+        )
 
         if len(partitioned_params) > 0:
             ctx.p_data_type = partitioned_params[0].dtype
@@ -492,11 +490,19 @@ class ORTPreForwardwardFunction(torch.autograd.Function):
         # if ctx.module.ds_grads_remaining == 0:
         ctx.module.ds_grads_remaining = 0  # pengwa
 
-        # for i, p in enumerate(ctx.partitioned_params):
-        #     if p.grad is None:
-        #         p.grad = args[ctx.num_of_input + i]
-        #     else:
-        #         p.grad += args[ctx.num_of_input + i]
+        for i, p in enumerate(ctx.partitioned_params):
+            if not p.requires_grad:
+                continue
+            if p.grad is None:
+                p.grad = torch.zeros_like(p)
+            print(
+                ctx.module.__class__.__name__
+                + " p.grad.size(): "
+                + str(p.grad.size())
+                + ", args[ctx.num_of_input + i].size(): "
+                + str(args[ctx.num_of_input + i].size())
+            )
+            p.grad += args[ctx.num_of_input + i]
 
         if ctx.num_of_input > 0:
             # print(f"Before Backward: {ctx.module.__class__.__name__}")
@@ -510,19 +516,15 @@ class ORTPreForwardwardFunction(torch.autograd.Function):
             None,
             None,
             None,
-        ) + args
+        ) + args[: ctx.num_of_input]
 
-        # if len(ctx.partitioned_params) > 0:
-        #     t += (torch.empty(0, dtype=ctx.p_data_type, device=ctx.p_device),) * len(
-        #         ctx.partitioned_params
-        #     )
+        if len(ctx.partitioned_params) > 0:
+            t += (torch.zeros((1,), dtype=torch.float32, device=ctx.p_device),) * len(ctx.partitioned_params)
 
         #     t += args[ctx.num_of_input : ctx.num_of_input + len(ctx.partitioned_params)]
 
-        # if ctx.kwarg_tensor_count > 0:
-        #     t += (
-        #         torch.zeros(1, device=ctx.device, dtype=ctx.data_type),
-        #     ) * ctx.kwarg_tensor_count
+        if ctx.kwarg_tensor_count > 0:
+            t += args[-ctx.kwarg_tensor_count :]
 
         return t
 
@@ -800,13 +802,21 @@ class DeepSpeedZeRoOffload(object):
             # if not torch._C.is_grad_enabled():
             #     self.get_param_coordinator(training=False).reset_step()
 
-            print("end of forward hook >>>>>>>>>>>>>")
             p_schema, p_flatten_tensors = _flatten_data_with_schema(outputs)
+
+            print(
+                "[Enter setup_zero_stage3_hooks] p_flatten_tensors: ",
+                [t.requires_grad for t in p_flatten_tensors],
+            )
             rets = ORTFinalForwardCleanupFunction.apply(
                 self,
                 torch._C.is_grad_enabled(),
                 len(p_flatten_tensors),
                 *p_flatten_tensors,
+            )
+            print(
+                "[Exit setup_zero_stage3_hooks] p_flatten_tensors: ",
+                [t.requires_grad for t in rets],
             )
 
             rets = _unflatten_data_from_schema(p_schema, rets)
@@ -814,15 +824,21 @@ class DeepSpeedZeRoOffload(object):
             if isinstance(rets, (tuple, list)) and len(rets) == 1:
                 rets = rets[0]
 
-            print("end of forward hooks results", rets)
-
             return rets
 
         # likely one of them should be enough but just to be safe
         # self._register_hooks_recursively(self.module)
-        self._register_hooks_recursively(self.module)
+        from optimum.onnxruntime.trainer import ModuleWithLoss
+
+        if isinstance(self.module, ModuleWithLoss):
+            self._register_hooks_recursively(self.module._original_model)
+        else:
+            self._register_hooks_recursively(self.module)
         # self.module.register_forward_hook(_end_of_forward_hook)
-        self.module._torch_module.module.register_forward_hook(_end_of_forward_hook)
+        if isinstance(self.module, ORTModule):
+            self.module._torch_module.module.register_forward_hook(_end_of_forward_hook)
+        else:
+            self.module.register_forward_hook(_end_of_forward_hook)
 
         # Add top module to stack trace
         global FWD_MODULE_STACK
@@ -975,58 +991,8 @@ class DeepSpeedZeRoOffload(object):
                 self.post_sub_module_backward_function(sub_module)
 
         def _ort_pre_forward_module_hook(module, inputs, kwargs):
-            from onnxruntime.training.ortmodule import ORTModule
-
             if isinstance(module, ORTModule):
                 return inputs, kwargs
-
-            # print("enter _ort_pre_forward_module_hook", module, module.training)
-
-            # flatten_input_list = []
-            # if isinstance(inputs, torch.Tensor):
-            #     flatten_input_list = [inputs]
-            #     print(
-            #         "88888888888888888_ort_pre_forward_module_hook inputs type",
-            #         type(inputs),
-            #         type(module),
-            #         inputs.dtype,
-            #         inputs.size(),
-            #     )
-            # elif isinstance(inputs, (tuple, list)):
-            #     print(
-            #         "88888888888888888_ort_pre_forward_module_hook inputs type",
-            #         [
-            #             f"{type(ret)}-{str(ret.size()) + '-' + str(ret.dtype) + '-' + str(ret.requires_grad) if isinstance(ret, torch.Tensor) else ''}"
-            #             for ret in inputs
-            #         ],
-            #         type(module),
-            #     )
-            #     if any(
-            #         [not isinstance(ret, (torch.Tensor, type(None))) for ret in inputs]
-            #     ):
-            #         raise RuntimeError(
-            #             "Found non-tensor or non-None input in the input list."
-            #         )
-            #     flatten_input_list = [ret for ret in inputs]
-            # elif isinstance(inputs, dict):
-            #     print(
-            #         "88888888888888888_ort_pre_forward_module_hook inputs type",
-            #         {key: type(ret) for key, ret in inputs.items()},
-            #         type(module),
-            #     )
-            #     if any(
-            #         [
-            #             not isinstance(ret, (torch.Tensor, type(None)))
-            #             for ret in inputs.values()
-            #         ]
-            #     ):
-            #         raise RuntimeError(
-            #             "Found non-tensor or non-None input in the input list."
-            #         )
-
-            #     flatten_input_list = [ret for ret in inputs.values()]
-            # else:
-            #     raise RuntimeError("Unsupported inputs type")
 
             params_to_fetch = frozenset(iter_params(module))
             partitioned_params = []
@@ -1043,7 +1009,11 @@ class DeepSpeedZeRoOffload(object):
             k_count = len(k_flatten_tensors)
 
             # hook_input_count = len(flatten_input_list)
-
+            print(
+                "[Enter _ort_pre_forward_module_hook Hook] for module "
+                + module.__class__.__name__,
+                [t.requires_grad for t in p_flatten_tensors + k_flatten_tensors],
+            )
             print(
                 "count of flatten input for ORTPreForwardwardFunction.apply: count of p_flatten_tensors:"
                 + str(p_count)
@@ -1077,38 +1047,36 @@ class DeepSpeedZeRoOffload(object):
                 *(p_flatten_tensors + partitioned_params + k_flatten_tensors),
             )
 
+            print(
+                f"[Exit _ort_pre_forward_module_hook Hook] for module {module.__class__.__name__}, partitioned_params's requires_grad:",
+                [t.requires_grad for t in partitioned_params],
+            )
+
+            print(
+                "[Exit _ort_pre_forward_module_hook Hook] for module "
+                + module.__class__.__name__,
+                [t.requires_grad for t in p_flatten_tensors + k_flatten_tensors],
+            )
+
             p_rets = rets[:p_count]
             k_rets = rets[-k_count:]
 
-            print(
-                "count of flatten output from ORTPreForwardwardFunction.apply: "
-                + str(len(rets))
-            )
+            # print(
+            #     "count of flatten output from ORTPreForwardwardFunction.apply: "
+            #     + str(len(rets))
+            # )
 
             assert rets is not None and len(rets) > 0
 
             # p_rets = _unflatten_data_from_schema(p_schema, p_rets)
             k_rets = _unflatten_data_from_schema(k_schema, k_rets)
 
-            # print(inputs, kwargs)
-            # print(rets[:hook_input_count], k_rets)
-
-            # if rets is None:
-            #     print(
-            #         "_ort_pre_forward_module_hook complete for module "
-            #         + module.__class__.__name__
-            #         + " with no output"
-            #     )
-
-            #     return None, k_rets
-            #     # return rets + flatten_input_list
-
             if len(p_rets) == 0:
-                print(
-                    "_ort_pre_forward_module_hook complete for module "
-                    + module.__class__.__name__
-                    + " with no output2"
-                )
+                # print(
+                #     "_ort_pre_forward_module_hook complete for module "
+                #     + module.__class__.__name__
+                #     + " with no output2"
+                # )
                 if isinstance(p_rets, torch.Tensor):
                     p_rets = [p_rets]
 
@@ -1119,42 +1087,43 @@ class DeepSpeedZeRoOffload(object):
                 #     )
                 return p_rets, k_rets
 
-            if isinstance(p_rets, torch.Tensor):
-                print(
-                    "88888888888888888_ort_pre_forward_module_hook output rets type",
-                    type(p_rets),
-                    type(module),
-                )
-            elif isinstance(p_rets, (tuple, list)):
-                print(
-                    "88888888888888888_ort_pre_forward_module_hook output rets type",
-                    [
-                        f"{type(ret)}-{str(ret.size()) + '-' + str(ret.dtype) + '-' + str(ret.requires_grad) if isinstance(ret, torch.Tensor) else ''}"
-                        for ret in p_rets
-                    ],
-                    type(module),
-                )
-                if any(
-                    [not isinstance(ret, (torch.Tensor, type(None))) for ret in p_rets]
-                ):
-                    print(
-                        "888888888888888888888888#########################",
-                        type(module),
-                    )
-            elif isinstance(p_rets, dict):
-                print(
-                    "88888888888888888_ort_pre_forward_module_hook output rets type",
-                    {key: type(ret) for key, ret in p_rets.items()},
-                    type(module),
-                )
+            # if isinstance(p_rets, torch.Tensor):
+            #     print(
+            #         "88888888888888888_ort_pre_forward_module_hook output rets type",
+            #         type(p_rets),
+            #         type(module),
+            #     )
+            # elif isinstance(p_rets, (tuple, list)):
+            #     print(
+            #         "88888888888888888_ort_pre_forward_module_hook output rets type",
+            #         [
+            #             f"{type(ret)}-{str(ret.size()) + '-' + str(ret.dtype) + '-' + str(ret.requires_grad) if isinstance(ret, torch.Tensor) else ''}"
+            #             for ret in p_rets
+            #         ],
+            #         type(module),
+            #     )
+            #     print(k_rets)
+            #     if any(
+            #         [not isinstance(ret, (torch.Tensor, type(None))) for ret in p_rets]
+            #     ):
+            #         print(
+            #             "888888888888888888888888#########################",
+            #             type(module),
+            #         )
+            # elif isinstance(p_rets, dict):
+            #     print(
+            #         "88888888888888888_ort_pre_forward_module_hook output rets type",
+            #         {key: type(ret) for key, ret in p_rets.items()},
+            #         type(module),
+            #     )
             if isinstance(p_rets, (tuple, list)) and len(p_rets) == 1:
-                print(
-                    "88888888888888888888 exist with single postional output ",
-                    p_rets[0].size(),
-                )
-                print(k_rets)
+                # print(
+                #     "88888888888888888888 exist with single postional output ",
+                #     p_rets[0].size(),
+                # )
+                # print(k_rets)
                 return p_rets, k_rets
-            return p_rets, k_rets
+            return tuple(p_rets), k_rets
             # # import traceback
             # # traceback.print_stack()
             # if input_count == 1:
@@ -1189,29 +1158,20 @@ class DeepSpeedZeRoOffload(object):
 
             if isinstance(module, ORTModule):
                 return
-            # print("enter _ort_post_forward_module_hook", module, module.training, outputs)
-            # input = inputs
-            # # output = outputs
-            # if isinstance(input, torch.Tensor):
-            #     input = [input]
-
-            # assert isinstance(input, (tuple, list))
-            # # assert isinstance(output, (tuple, list))
-            # input_and_output = []
-            # for i in input:
-            #     input_and_output.append(i)
-
-            # if not isinstance(outputs, (list, tuple, torch.Tensor)):
-            #     print(
-            #         "99999999999999_ort_post_forward_module_hook output type is: ",
-            #         type(outputs),
-            #     )
 
             input_schema, flatten_input_tensors = _flatten_data_with_schema(inputs)
             p_input_count = len(flatten_input_tensors)
 
             schema, flatten_output_tensors = _flatten_data_with_schema(outputs)
-            # input_and_output.extend(flatten_tensors)
+
+            print(
+                "[Enter ort_post_forward_module_hook Hook] pre-outputs type for module "
+                + module.__class__.__name__,
+                [
+                    str(ret.requires_grad) + "-" + str(ret.size())
+                    for ret in flatten_output_tensors
+                ],
+            )
 
             # input_tensors, packed_non_tensors = split_non_tensors(input)
             rets = ORTPostForwardwardFunction.apply(
@@ -1224,27 +1184,36 @@ class DeepSpeedZeRoOffload(object):
             )
             # print("exit _ort_post_forward_module_hook", module, module.training)
 
-            rets = _unflatten_data_from_schema(schema, rets)
+            print(
+                "[Exit ort_post_forward_module_hook Hook] pre-outputs type for module "
+                + module.__class__.__name__,
+                [
+                    str(ret.requires_grad) + "-" + str(ret.size())
+                    for ret in flatten_output_tensors
+                ],
+            )
 
-            if isinstance(rets, torch.Tensor):
-                print(
-                    "99999999999999_ort_post_forward_module_hook output rets type",
-                    type(rets),
-                )
-            elif isinstance(rets, (tuple, list)):
-                print(
-                    "99999999999999_ort_post_forward_module_hook output rets type",
-                    [type(ret) for ret in rets],
-                )
-                if any(
-                    [not isinstance(ret, (torch.Tensor, type(None))) for ret in rets]
-                ):
-                    print("9999999999999999999999#########################", module)
-            elif isinstance(rets, dict):
-                print(
-                    "99999999999999_ort_post_forward_module_hook output rets type",
-                    {key: type(ret) for key, ret in rets.items()},
-                )
+            # if isinstance(rets, torch.Tensor):
+            #     print(
+            #         "99999999999999_ort_post_forward_module_hook output rets type",
+            #         type(rets),
+            #     )
+            # elif isinstance(rets, (tuple, list)):
+            #     print(
+            #         "99999999999999_ort_post_forward_module_hook output rets type",
+            #         [str(ret.requires_grad) + "-" + str(ret.size()) for ret in rets],
+            #     )
+            #     if any(
+            #         [not isinstance(ret, (torch.Tensor, type(None))) for ret in rets]
+            #     ):
+            #         print("9999999999999999999999#########################", module)
+            # elif isinstance(rets, dict):
+            #     print(
+            #         "99999999999999_ort_post_forward_module_hook output rets type",
+            #         {key: type(ret) for key, ret in rets.items()},
+            #     )
+
+            rets = _unflatten_data_from_schema(schema, rets)
 
             # if isinstance(rets, (tuple, list)) and len(rets) == 1:
             #     return rets[0]
@@ -1268,14 +1237,14 @@ class DeepSpeedZeRoOffload(object):
 
         global FWD_MODULE_STACK
         FWD_MODULE_STACK.append(sub_module)
-        print(
-            "append moduke to stack "
-            + sub_module.__class__.__name__
-            + " "
-            + str(sub_module.id)
-            + " "
-            + str(len(FWD_MODULE_STACK))
-        )
+        # print(
+        #     "append moduke to stack "
+        #     + sub_module.__class__.__name__
+        #     + " "
+        #     + str(sub_module.id)
+        #     + " "
+        #     + str(len(FWD_MODULE_STACK))
+        # )
         # print("pre_sub_module_forward_function>> ", sub_module, len(FWD_MODULE_STACK))
 
         param_coordinator = self.get_param_coordinator(training=sub_module.training)
