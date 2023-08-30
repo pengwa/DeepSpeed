@@ -20,7 +20,7 @@
     Future:
         -- deepspeed groups API should be brought into ds.comm
 """
-
+from typing import Any, List
 import torch
 import os
 
@@ -54,6 +54,28 @@ hccl_backend = None
 
 # This should be set here so all rank/size information from the launcher can be propagated
 from deepspeed.comm.utils import *
+
+
+class DummyWork(torch.distributed.distributed_c10d.Work):
+    # def __init__(self):
+    #     pass
+
+    def is_completed(self) -> bool:
+        return True
+    def is_success(self) -> bool:
+        return True
+    def exception(self) -> Any:
+        return None
+    def wait(self, timeout: timedelta = timedelta) -> bool:
+        return True
+    def source_rank(self) -> int:
+        return 0
+    def _source_rank(self) -> int:
+        return 0
+    def result(self) -> List[torch.Tensor]:
+        return []
+    def synchronize(self):
+        pass
 
 
 class ProcessGroup():
@@ -313,6 +335,9 @@ def has_all_gather_into_tensor():
 
 
 def allgather_fn(output_tensor, input_tensor, group=None, async_op=False, debug=get_caller_func()):
+    if torch.onnx.is_in_onnx_export():
+        return DummyWork()
+
     global cdb
     assert cdb is not None and cdb.is_initialized(
     ), 'DeepSpeed backend not set, please initialize it using init_process_group()'

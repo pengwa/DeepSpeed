@@ -93,11 +93,14 @@ class LinearFunctionForZeroStage3(torch.autograd.Function):
                 grad_weight = grad_output.t().matmul(input)
             #print(f"Computed grad weight grad_weight {grad_weight.shape}")
         if bias is not None and ctx.needs_input_grad[2]:
-            #print("Computing grad bias")
-            grad_bias = grad_output.sum(0)
+            # print("Computing grad bias")
+            if dim > 2:
+                grad_bias = grad_output.sum([i for i in range(dim)])
+            else:
+                grad_bias = grad_output.sum(0)
             #print("Done computing grad bias")
             #print("needs bias")
-        #print(f"backward shaped grad_input {grad_input.shape}, grad_weight {grad_weight.shape}, grad_bias {grad_bias.shape if grad_bias is not None else None}")
+        # print(f"backward shaped grad_input {grad_input.shape}, grad_weight {grad_weight.shape}, grad_bias {grad_bias.shape if grad_bias is not None else None}")
         return grad_input, grad_weight, grad_bias
 
 
