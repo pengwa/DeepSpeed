@@ -95,7 +95,7 @@ class LinearFunctionForZeroStage3(torch.autograd.Function):
         if bias is not None and ctx.needs_input_grad[2]:
             # print("Computing grad bias")
             if dim > 2:
-                grad_bias = grad_output.sum([i for i in range(dim)])
+                grad_bias = grad_output.sum([i for i in range(dim - 1)])
             else:
                 grad_bias = grad_output.sum(0)
             #print("Done computing grad bias")
